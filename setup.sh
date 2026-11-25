@@ -23,7 +23,7 @@ if [[ ! -f "$ROOT/panel/package.json" || ! -d "$ROOT/stack" ]]; then
     if ! command -v git >/dev/null 2>&1; then
         echo "roomkey: installing git ..."
         sudo_=""; [[ $EUID -eq 0 ]] || sudo_=sudo
-        if command -v apt-get >/dev/null 2>&1; then $sudo_ apt-get update -qq && $sudo_ env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates
+        if command -v apt-get >/dev/null 2>&1; then { $sudo_ apt-get update -qq && $sudo_ env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates; } >/dev/null
         elif command -v dnf >/dev/null 2>&1; then $sudo_ dnf install -y -q git
         elif command -v yum >/dev/null 2>&1; then $sudo_ yum install -y -q git
         elif command -v apk >/dev/null 2>&1; then $sudo_ apk add --no-cache git
@@ -87,7 +87,13 @@ pkg_mgr() {
     local m
     for m in apt-get dnf yum apk pacman zypper brew; do command -v "$m" >/dev/null 2>&1 && { echo "$m"; return; }; done
 }
-pkg_refresh() {
+# the package managers' own chatter goes to ~/.roomkey/setup.log (errors still show)
+LOG="$STATE_DIR/setup.log"
+quiet() { mkdir -p "$STATE_DIR"; "$@" >>"$LOG"; }
+pkg_refresh() { quiet pkg_refresh_; }
+pkg_upgrade() { quiet pkg_upgrade_; }
+pkg_install() { quiet pkg_install_ "$@"; }
+pkg_refresh_() {
     case "$(pkg_mgr)" in
         apt-get) $SUDO apt-get update -qq ;;
         apk) $SUDO apk update -q ;;
@@ -95,7 +101,7 @@ pkg_refresh() {
         brew) brew update -q >/dev/null || true ;;
     esac
 }
-pkg_upgrade() {
+pkg_upgrade_() {
     case "$(pkg_mgr)" in
         apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade ;;
         dnf) $SUDO dnf -y -q upgrade ;;
@@ -106,7 +112,7 @@ pkg_upgrade() {
         brew) brew upgrade -q || true ;;
     esac
 }
-pkg_install() {   # <packages…>
+pkg_install_() {   # <packages…>
     case "$(pkg_mgr)" in
         apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
         dnf) $SUDO dnf install -y -q "$@" ;;
@@ -197,9 +203,9 @@ if (( ${#missing[@]} )) || ! node_ok; then
 fi
 
 # system updates, when this is a machine you look after as root (a server)
-if [[ $DRY == 0 && "$(uname -s)" == Linux ]] && can_root && [[ -n "$(pkg_mgr)" && "${UPDATED_AT:-}" != "$(date +%Y-%m-%d)" ]]; then
+if [[ "$(uname -s)" == Linux ]] && can_root && [[ -n "$(pkg_mgr)" && "${UPDATED_AT:-}" != "$(date +%Y-%m-%d)" ]]; then
     if yes_no "Install this system's pending updates first ($(pkg_mgr) upgrade)?" y; then
-        note "Updating the system (this can take a few minutes) …"
+        note "Updating the system (this can take a few minutes; details in $LOG) …"
         { pkg_refresh && pkg_upgrade; } || warn "some updates did not install (above); setup goes on"
         save UPDATED_AT "$(date +%Y-%m-%d)"
         ok "system up to date"
