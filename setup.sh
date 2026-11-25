@@ -161,6 +161,7 @@ save() {   # remember an answer (no secrets here)
 wr() { ( cd "$PANEL" && npx --no-install wrangler "$@" ); }
 
 [[ -x "$STATE_DIR/node/bin/node" ]] && export PATH="$STATE_DIR/node/bin:$PATH"
+export NPM_CONFIG_UPDATE_NOTIFIER=false NPM_CONFIG_FUND=false   # no npm adverts in the middle of setup
 printf '%sroomkey setup%s — the panel on Cloudflare, then the command for your first server.\n' "$B" "$N"
 [[ $DRY == 1 ]] && warn "dry run: nothing is sent to Cloudflare"
 # shellcheck source=/dev/null
