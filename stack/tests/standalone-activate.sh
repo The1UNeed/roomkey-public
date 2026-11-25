@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2218  # stubs are redefined further down on purpose
 # A standalone server (ss-rust, snell-server) changed in place: the new release
 # and settings replace the running ones only when they come up; otherwise the
 # previous binary, settings and service definition all go back, and recovery

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2218  # stubs are redefined further down on purpose
 # IP certificates (proxy-stack #9): the names lib/cert.sh takes, what it asks
 # acme.sh for an IP, the import check, the shared 443, and doctor's expiry
 # margin for a certificate that lives days, not months. Offline: acme.sh,
