@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# xray/routing.sh — Traffic routing rules management (split traffic to outbounds)
+# Manages rules with outboundTag starting with "out-" (PSM outbound prefix).
+
+source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/core.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/outbound.sh"
+
+ROUTE_CFG="$CFG_DIR/xray/routing_rules.json"
+
+# ── State helpers ─────────────────────────────────────────────────────────────
+_route_load() {
+    [[ -f "$ROUTE_CFG" ]] && jq '.' "$ROUTE_CFG" 2>/dev/null || echo '[]'
+}
+
+_route_save() {
+    mkdir -p "$(dirname "$ROUTE_CFG")"
+    printf '%s' "$1" | jq '.' > "$ROUTE_CFG"
+}
+
+_route_count() { _route_load | jq 'length' 2>/dev/null; }
+
+_route_next_id() {
+    local max; max=$(_route_load | jq '[.[].id // "r0" | ltrimstr("r") | tonumber] | max // 0' 2>/dev/null)
+    printf 'r%d' "$(( max + 1 ))"
+}
+
+# ── Build Xray routing rule JSON from stored entry ────────────────────────────
+_route_build_xray_rule() {
+    local e="$1"
+    local rtype; rtype=$(echo "$e"  | jq -r '.rule_type')
+    local val;   val=$(echo "$e"    | jq -r '.value')
+    local outtag; outtag=$(echo "$e" | jq -r '.outbound_tag')
+
+    case "$rtype" in
+    geosite)
+        # Xray-core has NO top-level "geosite" rule field — geosite entries must
+        # go INTO the "domain" array, each prefixed with "geosite:". Emitting a
+        # bare {"geosite":[...]} key is silently ignored, so the rule never fires.
+        # value may be comma-separated ("netflix,openai"); prefix is idempotent
+        # so a user-typed "geosite:netflix" isn't double-prefixed.
+        local arr; arr=$(echo "$val" | tr ',' '\n' \
+            | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d;s/^(geosite:)?/geosite:/' \
+            | jq -R . | jq -sc .)
+        jq -n --argjson dm "$arr" --arg ot "$outtag" \
+            '{"type":"field","domain":$dm,"outboundTag":$ot}'
+        ;;
+    geoip)
+        # Same story for geoip: it belongs in the "ip" array as "geoip:us".
+        local arr; arr=$(echo "$val" | tr ',' '\n' \
+            | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d;s/^(geoip:)?/geoip:/' \
+            | jq -R . | jq -sc .)
+        jq -n --argjson ip "$arr" --arg ot "$outtag" \
+            '{"type":"field","ip":$ip,"outboundTag":$ot}'
+        ;;
+    domain)
+        local arr; arr=$(echo "$val" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -sc .)
+        jq -n --argjson dm "$arr" --arg ot "$outtag" \
+            '{"type":"field","domain":$dm,"outboundTag":$ot}'
+        ;;
+    ip)
+        local arr; arr=$(echo "$val" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -sc .)
+        jq -n --argjson ip "$arr" --arg ot "$outtag" \
+            '{"type":"field","ip":$ip,"outboundTag":$ot}'
+        ;;
+    all)
+        # 全部流量走该出口。Xray 没有「catch-all」关键字，靠一条不带任何域名 / IP
+        # 匹配条件、只声明 network 的 field 规则实现——它会命中所有 TCP/UDP 连接。
+        # 这条规则必须排在最后（_route_apply_to_xray 按 id 顺序写出，UI 侧保证）。
+        # 注意作用范围：只影响经由入站进来的客户端流量，不影响本机自身出网。
+        jq -n --arg ot "$outtag" \
+            '{"type":"field","network":"tcp,udp","outboundTag":$ot}'
+        ;;
+    inbound)
+        local arr; arr=$(echo "$val" | tr ',' '\n' | jq -R . | jq -sc .)
+        # .geosite (a node's exit, lib/exit_cli.sh): only those sites from that
+        # inbound. Fields of one Xray rule are ANDed, which is what that means.
+        local geo; geo=$(echo "$e" | jq -c '(.geosite // "") | split(",") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0) | "geosite:" + ltrimstr("geosite:"))')
+        jq -n --argjson ib "$arr" --arg ot "$outtag" --argjson dm "$geo" \
+            '{"type":"field","inboundTag":$ib,"outboundTag":$ot} + (if ($dm | length) > 0 then {"domain":$dm} else {} end)'
+        ;;
+    ruleset)
+        # 订阅式规则集（lib/ruleset/）。Xray 没有规则集机制，只能把规则内联展开进
+        # routing rules，规则内容取自 ruleset 模块解析好的 JSON（按名字定位，避免
+        # 让本文件依赖 ruleset 模块）。
+        #
+        # 必须拆成【两条】规则：Xray 同一条 rule 里的不同字段是 AND 语义——domain
+        # 和 ip 写在一起表示「域名命中 且 IP 命中」，实际永远不会同时成立，规则看着
+        # 加上了却一次都不触发，是最难查的那种失效。返回 JSON 数组，由
+        # _route_apply_to_xray 摊平。
+        local parsed_file="$CFG_DIR/ruleset/parsed/${val}.json"
+        [[ -s "$parsed_file" ]] || return 0
+        jq -c --arg ot "$outtag" '
+            ( [ (.domain[]?         | "full:"    + .),
+                (.domain_suffix[]?  | "domain:"  + .),
+                (.domain_keyword[]? | "keyword:" + .) ] ) as $dm
+            | ( .ip_cidr // [] ) as $ip
+            | ( if ($dm | length) > 0 then [{type:"field", domain:$dm, outboundTag:$ot}] else [] end )
+            + ( if ($ip | length) > 0 then [{type:"field", ip:$ip,     outboundTag:$ot}] else [] end )
+        ' "$parsed_file"
+        ;;
+    esac
+}
+
+# ── Sync routing state → Xray config ─────────────────────────────────────────
+_route_apply_to_xray() {
+    [[ -f "$XRAY_CFG" ]] || return 1
+    local rules; rules=$(_route_load)
+    local count; count=$(echo "$rules" | jq 'length')
+
+    local tmp; tmp=$(mktemp)
+
+    # Remove all PSM routing rules (outboundTag starts with "out-"), preserving
+    # api/blocked/direct rules untouched. `(.routing.rules) //= []` first so a
+    # config without a routing.rules array (older/hand-edited configs) can't
+    # crash jq ("Cannot iterate over null") and blank out the whole config.
+    if ! jq '(.routing.rules) //= []
+             | del(.routing.rules[] | select((.outboundTag // "") | startswith("out-")))' \
+             "$XRAY_CFG" > "$tmp"; then
+        log_error "$(t xray.routing.read_fail)"; rm -f "$tmp"; return 1
+    fi
+
+    # Set domainStrategy if any geosite/domain rules exist
+    local needs_dns=0
+    echo "$rules" | jq -e '[.[].rule_type] | any(. == "geosite" or . == "domain" or . == "ruleset" or . == "all")' &>/dev/null \
+        && needs_dns=1
+    if (( needs_dns )); then
+        local tmp2; tmp2=$(mktemp)
+        if jq '.routing.domainStrategy = "IPIfNonMatch"' "$tmp" > "$tmp2"; then
+            mv "$tmp2" "$tmp"
+        else
+            rm -f "$tmp2"
+        fi
+    fi
+
+    # Build PSM rule array
+    local psm_rules='[]'
+    local i
+    for (( i=0; i<count; i++ )); do
+        local entry; entry=$(echo "$rules" | jq ".[$i]")
+        local xrule; xrule=$(_route_build_xray_rule "$entry")
+        # ruleset 分支会吐一个数组（域名一条、IP 一条），其余分支吐单个对象。
+        [[ -n "$xrule" ]] && psm_rules=$(echo "$psm_rules" | jq --argjson r "$xrule" \
+            '. += (if ($r | type) == "array" then $r else [$r] end)')
+    done
+
+    # Insert PSM rules right after the api rule (highest routing priority)
+    local tmp2; tmp2=$(mktemp)
+    if ! jq --argjson pr "$psm_rules" '
+        .routing.rules =
+            [.routing.rules[]? | select(.outboundTag == "api")]
+            + $pr
+            + [.routing.rules[]? | select(.outboundTag != "api")]
+    ' "$tmp" > "$tmp2"; then
+        log_error "$(t xray.routing.gen_fail)"; rm -f "$tmp" "$tmp2"; return 1
+    fi
+    rm -f "$tmp"
+    _xray_write_cfg_checked "$tmp2"
+}
+
+# ── Interactive: add rule ─────────────────────────────────────────────────────
+route_add_wizard() {
+    _xray_require_installed || return
+
+    # Must have at least one outbound
+    local ob_count; ob_count=$(_outb_count)
+    if (( ob_count == 0 )); then
+        log_error "$(t xray.routing.need_outbound)"
+        return
+    fi
+
+    echo -e "\n${BOLD}$(t xray.routing.add_title)${NC}"
+
+    # Pick outbound
+    echo ""
+    echo "  $(t xray.routing.available_outbounds)"
+    local ob_tags=() ob_i=0
+    while IFS=$'\t' read -r tag proto addr remark; do
+        ob_i=$((ob_i+1)); ob_tags+=("$tag")
+        printf "  ${CYAN}%2d.${NC} %-20s %-16s %s  %s\n" "$ob_i" "$tag" "$proto" "$addr" "$remark"
+    done < <(_outb_list)
+    echo ""
+    local ob_sel
+    read -rp "$(echo -e "${CYAN}$(t xray.routing.ask_outbound)${NC}")" ob_sel
+    if ! [[ "$ob_sel" =~ ^[0-9]+$ ]] || (( ob_sel < 1 || ob_sel > ob_i )); then
+        log_warn "$(t xray.invalid_option)"; return; fi
+    local outbound_tag="${ob_tags[$((ob_sel-1))]}"
+
+    # Pick rule type
+    echo ""
+    echo "  $(t xray.routing.type_title)"
+    echo "    $(t xray.routing.type1)"
+    echo "    $(t xray.routing.type2)"
+    echo "    $(t xray.routing.type3)"
+    echo "    $(t xray.routing.type4)"
+    echo "    $(t xray.routing.type5)"
+    echo ""
+    local rt_sel
+    read -rp "$(echo -e "${CYAN}$(t xray.routing.ask_type)${NC}")" rt_sel
+    rt_sel="${rt_sel:-1}"
+
+    local rule_type value remark
+    case "$rt_sel" in
+    1)
+        rule_type="geosite"
+        echo ""
+        echo "  $(t xray.routing.geosite_common)"
+        echo "    netflix  openai  google  telegram  twitter  youtube"
+        echo "    $(t xray.routing.geosite_noncn)"
+        ask value  "$(t xray.routing.ask_geosite)" "netflix"
+        ask remark "$(t xray.routing.ask_remark)" "${value} → ${outbound_tag}"
+        ;;
+    2)
+        rule_type="geoip"
+        echo ""
+        echo "  $(t xray.routing.geoip_common)"
+        echo "    us  jp  hk  sg  gb  de  kr  tw  au"
+        ask value  "$(t xray.routing.ask_geoip)" "us"
+        ask remark "$(t xray.routing.ask_remark)" "GeoIP:${value} → ${outbound_tag}"
+        ;;
+    3)
+        rule_type="domain"
+        ask value  "$(t xray.routing.ask_domains)" ""
+        ask remark "$(t xray.routing.ask_remark)" "${value} → ${outbound_tag}"
+        [[ -z "$value" ]] && { log_error "$(t xray.routing.domain_empty)"; return 1; }
+        ;;
+    4)
+        rule_type="ip"
+        ask value  "$(t xray.routing.ask_ipcidr)" ""
+        ask remark "$(t xray.routing.ask_remark)" "IP:${value} → ${outbound_tag}"
+        [[ -z "$value" ]] && { log_error "$(t xray.routing.ip_empty)"; return 1; }
+        ;;
+    5)
+        rule_type="inbound"
+        echo ""
+        echo "  $(t xray.routing.inbound_hint)"
+        ask value  "$(t xray.routing.ask_inbound)" ""
+        ask remark "$(t xray.routing.ask_remark)" "inbound:${value} → ${outbound_tag}"
+        [[ -z "$value" ]] && { log_error "$(t xray.routing.inbound_empty)"; return 1; }
+        ;;
+    *)
+        log_warn "$(t xray.invalid_option)"; return ;;
+    esac
+
+    local id; id=$(_route_next_id)
+    local entry
+    entry=$(jq -n --arg id "$id" --arg remark "$remark" \
+                   --arg rtype "$rule_type" --arg val "$value" --arg ot "$outbound_tag" \
+        '{id:$id,remark:$remark,rule_type:$rtype,value:$val,outbound_tag:$ot}')
+
+    local rules; rules=$(_route_load)
+    rules=$(echo "$rules" | jq ". += [$entry]")
+    _route_save "$rules"
+    _route_apply_to_xray
+    xray_test_restart   # config on disk is useless until Xray reloads it
+    log_ok "$(t xray.routing.added "$remark")"
+}
+
+# ── Interactive: delete rule ──────────────────────────────────────────────────
+route_delete() {
+    local count; count=$(_route_count)
+    (( count == 0 )) && { log_warn "$(t xray.routing.no_rules)"; return; }
+
+    echo -e "\n${BOLD}$(t xray.routing.delete_title)${NC}"
+    local rules; rules=$(_route_load)
+    local ids_arr=() i=0
+    while IFS= read -r entry; do
+        i=$((i+1))
+        local id remark rtype val ot
+        id=$(echo "$entry"     | jq -r '.id')
+        remark=$(echo "$entry" | jq -r '.remark // ""')
+        rtype=$(echo "$entry"  | jq -r '.rule_type')
+        val=$(echo "$entry"    | jq -r '.value')
+        ot=$(echo "$entry"     | jq -r '.outbound_tag')
+        ids_arr+=("$id")
+        printf "  ${CYAN}%2d.${NC} [%-8s] %-30s → %-20s %s\n" \
+            "$i" "$rtype" "$val" "$ot" "$remark"
+    done < <(echo "$rules" | jq -c '.[]')
+
+    local sel
+    read -rp "$(echo -e "${CYAN}$(t xray.select_index_cancel)${NC}")" sel
+    [[ -z "$sel" || "$sel" == "0" ]] && return
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > i )); then
+        log_warn "$(t xray.invalid_option)"; return; fi
+
+    local del_id="${ids_arr[$((sel-1))]}"
+    local new_rules; new_rules=$(echo "$rules" | jq --arg id "$del_id" 'del(.[] | select(.id == $id))')
+    _route_save "$new_rules"
+    _route_apply_to_xray
+    xray_test_restart
+    log_ok "$(t xray.routing.deleted "$del_id")"
+}
+
+# ── Display ───────────────────────────────────────────────────────────────────
+route_show() {
+    local count; count=$(_route_count)
+    echo -e "\n${BOLD}${BLUE}$(t xray.routing.list_title)${NC}"
+    if (( count == 0 )); then
+        echo -e "  ${YELLOW}$(t xray.routing.none)${NC}"
+        echo -e "  $(t xray.routing.hint)"
+    else
+        local rules; rules=$(_route_load)
+        local i=0
+        while IFS= read -r entry; do
+            i=$((i+1))
+            local rtype val ot remark
+            rtype=$(echo "$entry"  | jq -r '.rule_type')
+            val=$(echo "$entry"    | jq -r '.value')
+            ot=$(echo "$entry"     | jq -r '.outbound_tag')
+            remark=$(echo "$entry" | jq -r '.remark // ""')
+            printf "  ${CYAN}%2d.${NC} [${YELLOW}%-8s${NC}] %-36s ${GREEN}→${NC} %-20s %s\n" \
+                "$i" "$rtype" "$val" "$ot" "$remark"
+        done < <(echo "$rules" | jq -c '.[]')
+    fi
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════${NC}"
+}
+
+# ── Menu ──────────────────────────────────────────────────────────────────────
+route_menu() {
+    _xray_require_installed || return
+    while true; do
+        show_menu "$(t xray.routing.menu.title)" \
+            "$(t xray.routing.menu.view)" \
+            "$(t xray.routing.menu.add)" \
+            "$(t xray.routing.menu.delete)" \
+            "$(t xray.routing.menu.outbound_sep)" \
+            "$(t xray.outbound.menu.view)" \
+            "$(t xray.outbound.menu.add)" \
+            "$(t xray.outbound.menu.delete)" \
+            "$(t xray.routing.menu.warp_sep)" \
+            "$(t xray.routing.menu.warp)" \
+            "$(t xray.routing.menu.vpngate)" \
+            "$(t xray.routing.menu.ruleset)"
+
+        case "$MENU_CHOICE" in
+            1) route_show;      press_enter ;;
+            2) route_add_wizard; press_enter ;;
+            3) route_delete;    press_enter ;;
+            4) ;;  # separator
+            5) outb_show;       press_enter ;;
+            6) outb_add_wizard; press_enter ;;
+            7) outb_delete;     press_enter ;;
+            8) ;;  # separator
+            9)
+                source "$(dirname "${BASH_SOURCE[0]}")/warp.sh"
+                warp_menu
+                ;;
+            10)
+                source "$LIB_DIR/vpngate.sh"
+                vpngate_menu xray
+                ;;
+            11)
+                source "$LIB_DIR/ruleset.sh"
+                ruleset_menu xray
+                ;;
+            0) return ;;
+        esac
+    done
+}

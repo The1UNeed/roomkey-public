@@ -1,0 +1,61 @@
+name: CI
+
+# roomkey's checks on every push and pull request to this repository (GitHub-
+# hosted runners; the PSM workflows under stack/.github are upstream's, for its
+# own self-hosted VPS, and do not run here).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stack:
+    name: stack (ShellCheck · i18n · shell tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: debian:13
+    steps:
+      - run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git shellcheck jq openssl curl ca-certificates util-linux iproute2 procps >/dev/null
+      - uses: actions/checkout@v4
+      - run: cd stack && bash scripts/ci.sh
+
+  agent:
+    name: psm-agent (gofmt · vet · race tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: stack/agent/go.mod
+      - working-directory: stack/agent
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race -count=1 ./...
+
+  panel:
+    name: panel (typecheck · tests · build · end to end)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+      - working-directory: panel
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm run e2e

@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "psm-panel",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-09-01",
+  // no *.workers.dev or preview address: the panel answers on its own host
+  // names only (workers.dev is blocked in mainland China anyway)
+  "workers_dev": false,
+  "preview_urls": false,
+  // the admin host names (Cloudflare Access in front of them); the
+  // subscription host serves /sub/ and /api/agent/ only
+  "vars": { "ADMIN_HOSTS": "admin.myroom.asia" },
+  // The API and the subscription always reach the Worker; everything else is
+  // the panel's pages, built by `npm run build` into web/dist.
+  "assets": {
+    "directory": "./web/dist",
+    "binding": "ASSETS",
+    // every path: the admin pages answer only on ADMIN_HOSTS (worker/src/index.ts)
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "psm-panel",
+      // No database_id: the Deploy to Cloudflare button (or `wrangler deploy`)
+      // creates the database, and the Worker creates its own tables.
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Run the Worker near its D1 database rather than near each visitor: a page
+  // of the panel makes several queries, each one a round trip to D1.
+  "placement": { "mode": "smart" },
+  // Every five minutes: roomkey's periods, device pauses, user lists and
+  // alerts; the housekeeping (old logs, tasks, samples) runs at most hourly.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  // Logs, but no invocation logs: those record each request's URL, and a
+  // subscription URL is its user's key
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } }
+  // Secrets (never in this file): ADMIN_PASSWORD (required), TOKEN_KEY (optional),
+  // CF_DNS_TOKEN (optional: Zone · DNS · Edit, for servers' host names).
+  // Variables to set when deploying: INSTALL_URL and PSM_REPO (docs/DEPLOY.md
+  // step 0), CF_ZONE_ID (optional)
+}

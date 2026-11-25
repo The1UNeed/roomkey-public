@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+# realm.sh — realm TCP/UDP 中转（端口转发 / 流量中转）管理
+#
+# 典型用法：在网络优质的中转机（如 HK/SG）上监听一个端口，把流量转发到
+# 落地机的代理端口。realm 只做 L4 转发，不解析/不解密流量，落地机上的
+# 协议（Reality/SS/Hysteria2 等）配置无需改动。
+
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+REALM_BIN="/usr/local/bin/realm"
+REALM_CFG_DIR="/etc/realm"
+REALM_TOML="${REALM_CFG_DIR}/config.toml"
+REALM_SERVICE="/etc/systemd/system/realm.service"
+REALM_STORE="$CFG_DIR/realm/rules.json"
+REALM_RELEASES="https://github.com/zhboner/realm/releases"
+REALM_FALLBACK_TAG="v2.9.4"
+
+# ── Rule store（JSON 为唯一事实源，config.toml 由它生成）─────────────────────
+# The store holds the relays of both engines (psm relay --engine realm|gost):
+# a rule without "engine" is realm's, as every rule written before gost was.
+# The menu below manages realm's; gost's (lib/gost.sh) are psm relay's alone.
+# A tunnel rule carries its password, so the file is root's only.
+_realm_load() {
+    if [[ ! -f "$REALM_STORE" ]]; then
+        mkdir -p "$(dirname "$REALM_STORE")"
+        echo "[]" > "$REALM_STORE"
+        chmod 600 "$REALM_STORE" 2>/dev/null || true
+    fi
+    cat "$REALM_STORE"
+}
+_realm_save() {   # atomic: the old store or the new one, never half of it
+    mkdir -p "$(dirname "$REALM_STORE")" || return 1
+    printf '%s\n' "$1" > "$REALM_STORE.tmp" && chmod 600 "$REALM_STORE.tmp" && mv -f "$REALM_STORE.tmp" "$REALM_STORE"
+}
+_REALM_ONLY='[.[] | select((.engine // "realm") == "realm")]'
+_realm_count() { _realm_load | jq "$_REALM_ONLY | length" 2>/dev/null; }
+_realm_get_by_tag() { _realm_load | jq --arg t "$1" '.[] | select(.tag == $t)' 2>/dev/null; }
+_realm_list() {
+    _realm_load | jq -r "$_REALM_ONLY"'[] |
+        "\(.tag)\t\(.listen_port)\t\(.remote_host)\t\(.remote_port)\t\(if .udp then "TCP+UDP" else "TCP" end)"' 2>/dev/null
+}
+# A gost rule named in the menu: the menu writes realm rules only.
+_realm_is_gost() { [[ "$(printf '%s' "$1" | jq -r '.engine // "realm"' 2>/dev/null)" == gost ]]; }
+# roomkey runs no relays (a public forward hands whatever is behind it to
+# anyone): no rule is ever added or changed, only removed (psm relay off).
+_realm_upsert() {
+    log_error "relays are off in roomkey: a relay can only be removed (psm relay off)"
+    return 1
+    # shellcheck disable=SC2317
+    local n="$1" tag; tag=$(echo "$n" | jq -r '.tag')
+    local rules; rules=$(_realm_load)
+    rules=$(echo "$rules" | jq --arg t "$tag" --argjson n "$n" 'del(.[] | select(.tag == $t)) | . += [$n]')
+    _realm_save "$rules"
+}
+_realm_delete() {
+    local rules; rules=$(_realm_load)
+    _realm_save "$(echo "$rules" | jq --arg t "$1" 'del(.[] | select(.tag == $t))')"
+}
+
+# remote 目标写进 TOML 时的地址：IPv6 需加方括号，IPv4/域名原样。
+_realm_fmt_remote() {
+    local host="$1" port="$2"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+# ── 由 JSON 存储生成 realm 的 TOML 配置 ───────────────────────────────────────
+_realm_gen_toml() {
+    local rules; rules=$(_realm_load | jq "$_REALM_ONLY")
+    local count; count=$(echo "$rules" | jq 'length')
+    mkdir -p "$REALM_CFG_DIR"
+
+    {
+        echo "# $(t realm.config.header1)"
+        echo "# $(t realm.config.header2)"
+        echo ""
+        echo "[network]"
+        echo "no_tcp = false"
+        echo "use_udp = false"
+        local i
+        for ((i = 0; i < count; i++)); do
+            local rule listen remote_host remote_port udp remote
+            rule=$(echo "$rules" | jq ".[$i]")
+            listen=$(echo "$rule"      | jq -r '.listen_port')
+            remote_host=$(echo "$rule" | jq -r '.remote_host')
+            remote_port=$(echo "$rule" | jq -r '.remote_port')
+            udp=$(echo "$rule"         | jq -r '.udp')
+            remote=$(_realm_fmt_remote "$remote_host" "$remote_port")
+            echo ""
+            echo "[[endpoints]]"
+            echo "listen = \"0.0.0.0:${listen}\""
+            echo "remote = \"${remote}\""
+            # More than one target (psm relay --target, several times): realm
+            # takes the first as remote and the rest as extra_remotes, and
+            # spreads connections over them by round robin, or by client IP.
+            # It checks no target's health: that is what gost is for.
+            local extra n
+            n=$(echo "$rule" | jq '(.targets // []) | length')
+            if (( n > 1 )); then
+                extra=$(echo "$rule" | jq -r '.targets[1:][] | "\(.host)\t\(.port)"' | while IFS=$'\t' read -r h p; do
+                    printf '"%s", ' "$(_realm_fmt_remote "$h" "$p")"; done)
+                echo "extra_remotes = [${extra%, }]"
+                local algo=roundrobin weights
+                [[ "$(echo "$rule" | jq -r '.strategy // ""')" == hash ]] && algo=iphash
+                weights=$(printf '1, %.0s' $(seq 1 "$n")); weights=${weights%, }
+                echo "balance = \"${algo}: ${weights}\""
+            fi
+            # The hop's own encryption (psm relay --tls). realm wraps the
+            # forwarded stream in TLS: the side that forwards to this machine
+            # terminates it (it holds the certificate), any other side dials it.
+            # Rules written by the menu have no tls field and are unaffected.
+            local tls tls_sni tls_cert tls_key tls_insecure
+            tls=$(echo "$rule" | jq -r '.tls // false')
+            if [[ "$tls" == "true" ]]; then
+                tls_sni=$(echo "$rule"      | jq -r '.tls_sni // ""')
+                tls_cert=$(echo "$rule"     | jq -r '.tls_cert // ""')
+                tls_key=$(echo "$rule"      | jq -r '.tls_key // ""')
+                tls_insecure=$(echo "$rule" | jq -r '.tls_insecure // false')
+                if [[ -n "$tls_cert" && -n "$tls_key" ]]; then
+                    echo "listen_transport = \"tls;servername=${tls_sni};cert=${tls_cert};key=${tls_key}\""
+                else
+                    local opts="tls;sni=${tls_sni}"
+                    [[ "$tls_insecure" == "true" ]] && opts="${opts};insecure"
+                    echo "remote_transport = \"${opts}\""
+                fi
+            fi
+            if [[ "$udp" == "true" ]]; then
+                echo "[endpoints.network]"
+                echo "use_udp = true"
+            fi
+        done
+    } > "$REALM_TOML"
+    chmod 600 "$REALM_TOML" 2>/dev/null || true
+}
+
+# A relay engine taken off the server for good (roomkey runs no relays):
+# stopped, disabled, its service definition, binary and generated config
+# removed — so no restart, menu or boot can bring a forward back — and read
+# back strictly: the service manager says inactive and disabled (or has no
+# such service), no process of it runs, and none of those files is left.
+relay_engine_files() {   # <realm | psm-gost> → the files PSM writes for it (under PSM_FS_ROOT in tests)
+    local r="${PSM_FS_ROOT:-}"
+    case "$1" in
+        realm) printf '%s\n' "$r$REALM_SERVICE" "$r${PSM_INITD_DIR:-/etc/init.d}/realm" "$r$REALM_BIN" "$r$REALM_TOML" ;;
+        *)     printf '%s\n' "$r${GOST_SERVICE:-/etc/systemd/system/psm-gost.service}" "$r${PSM_INITD_DIR:-/etc/init.d}/psm-gost" \
+                   "$r${GOST_BIN:-/usr/local/bin/psm-gost}" "$r${GOST_DIR:-/etc/psm-gost}/config.json" ;;
+    esac
+}
+relay_engine_off() {   # <service: realm | psm-gost>
+    declare -f _coreperm_svc_state >/dev/null || source "$LIB_DIR/coreperm.sh" || return 1
+    local svc="$1" f left="" load
+    svc_stop "$svc" >/dev/null 2>&1 || true
+    svc_disable "$svc" >/dev/null 2>&1 || true
+    # shown down first: nothing is deleted while it may still run
+    [[ "$(_coreperm_svc_state "$svc")" == inactive ]] || return 1
+    # then what PSM wrote for it (its unit, init script, binary and generated
+    # config; other files beside them are not PSM's and stay)
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        rm -f -- "$f" 2>/dev/null || true
+        [[ -e "$f" ]] && left+=" $f"
+        rmdir -- "$(dirname "$f")" 2>/dev/null || true   # only if nothing else is in it
+    done < <(relay_engine_files "$svc")
+    [[ -z "$left" ]] || { log_error "$svc: could not remove$left"; return 1; }
+    if _uses_systemd; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # and no definition of it left anywhere the service manager loads from
+        load=$(systemctl show -p LoadState -p FragmentPath "$svc" 2>/dev/null) || return 1
+        if ! grep -qx 'LoadState=not-found' <<<"$load"; then
+            log_error "$svc: a unit is still loaded from $(sed -n 's/^FragmentPath=//p' <<<"$load"): remove it"
+            return 1
+        fi
+    fi
+    [[ "$(_coreperm_svc_state "$svc")" == inactive && "$(_coreperm_svc_boot "$svc")" == disabled ]]
+}
+
+# 重新生成配置并重启服务；若无规则则停止服务（realm 空 endpoints 会启动失败）。
+_realm_apply() {
+    _realm_gen_toml
+    local count; count=$(_realm_count)
+    if [[ "$count" == "0" ]]; then
+        # no rule left: realm must be down, verified — a removal is not done
+        # while the last forward could still be running
+        relay_engine_off realm || { log_error "realm could not be shown stopped and disabled"; return 1; }
+        log_info "$(t realm.no_rules_stopped)"
+        return 0
+    fi
+    svc_enable realm 2>/dev/null || true
+    if svc_restart realm; then
+        sleep 1
+        if svc_is_active realm; then
+            log_ok "$(t realm.service_applied "$count")"
+        else
+            log_error "$(t realm.service_not_active)"
+            svc_log_tail realm 15
+            return 1
+        fi
+    else
+        log_error "$(t realm.restart_failed)"
+        return 1
+    fi
+}
+
+# ── 安装 ──────────────────────────────────────────────────────────────────────
+realm_install() {
+    ensure_pkg_deps curl tar jq
+    require_cmd curl tar jq
+
+    if [[ -f "$REALM_BIN" ]]; then
+        log_info "$(t realm.installed "$("$REALM_BIN" --version 2>/dev/null | head -1)")"
+        ask_yn "$(t realm.ask_reinstall)" N || return 0
+    fi
+
+    local arch; arch=$(get_arch)
+    local realm_arch
+    case "$arch" in
+        amd64) realm_arch="x86_64-unknown-linux-musl" ;;
+        arm64) realm_arch="aarch64-unknown-linux-musl" ;;
+        arm32) realm_arch="armv7-unknown-linux-musleabihf" ;;
+        *)     die "$(t realm.unsupported_arch "$arch")" ;;
+    esac
+
+    local tag
+    log_step "$(t realm.fetching_latest)"
+    tag=$(gh_latest_tag zhboner/realm)
+    [[ "$tag" =~ ^v[0-9] ]] || { log_warn "$(t realm.latest_fallback "$REALM_FALLBACK_TAG")"; tag="$REALM_FALLBACK_TAG"; }
+
+    local file="realm-${realm_arch}.tar.gz"
+    local url="${REALM_RELEASES}/download/${tag}/${file}"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+
+    log_step "$(t realm.downloading "$tag" "$realm_arch")"
+    if ! curl "${PSM_DL[@]}" -fsSL -o "$tmp_dir/$file" "$url"; then
+        rm -rf "$tmp_dir"; die "$(t realm.download_fail "$url")"
+    fi
+    tar -xzf "$tmp_dir/$file" -C "$tmp_dir" || { rm -rf "$tmp_dir"; die "$(t realm.extract_fail "$file")"; }
+    if [[ ! -f "$tmp_dir/realm" ]]; then
+        rm -rf "$tmp_dir"; die "$(t realm.binary_missing)"
+    fi
+    install -m 755 "$tmp_dir/realm" "$REALM_BIN"
+    rm -rf "$tmp_dir"
+
+    mkdir -p "$REALM_CFG_DIR"
+    _realm_write_service
+    svc_daemon_reload
+    log_ok "$(t realm.install_done "$tag")"
+
+    # 保留已有规则；仅在存储为空时提示新增第一条。
+    local count; count=$(_realm_count)
+    if [[ "$count" == "0" ]]; then
+        echo ""
+        ask_yn "$(t realm.ask_add_first)" Y && realm_add_rule
+    else
+        _realm_apply
+    fi
+}
+
+# realm itself, without questions: `psm relay` and the panel's agent install it
+# before the first rule. realm_install asks before reinstalling and offers to
+# add a rule; this only fetches what is missing and writes the service.
+realm_install_unattended() {
+    [[ -x "$REALM_BIN" ]] && return 0
+    ensure_pkg_deps curl tar jq >/dev/null 2>&1 || true
+    require_cmd curl tar jq || return 1
+
+    local arch realm_arch
+    arch=$(get_arch)
+    case "$arch" in
+        amd64) realm_arch="x86_64-unknown-linux-musl" ;;
+        arm64) realm_arch="aarch64-unknown-linux-musl" ;;
+        arm32) realm_arch="armv7-unknown-linux-musleabihf" ;;
+        *) log_error "$(t realm.unsupported_arch "$arch")"; return 1 ;;
+    esac
+
+    local tag; tag=$(gh_latest_tag zhboner/realm)
+    [[ "$tag" =~ ^v[0-9] ]] || tag="$REALM_FALLBACK_TAG"
+
+    local file="realm-${realm_arch}.tar.gz"
+    local url="${REALM_RELEASES}/download/${tag}/${file}"
+    local tmp_dir; tmp_dir=$(mktemp -d) || return 1
+    if ! curl "${PSM_DL[@]}" -fsSL -o "$tmp_dir/$file" "$url"; then
+        rm -rf "$tmp_dir"; log_error "$(t realm.download_fail "$url")"; return 1
+    fi
+    tar -xzf "$tmp_dir/$file" -C "$tmp_dir" || { rm -rf "$tmp_dir"; log_error "$(t realm.extract_fail "$file")"; return 1; }
+    [[ -f "$tmp_dir/realm" ]] || { rm -rf "$tmp_dir"; log_error "$(t realm.binary_missing)"; return 1; }
+    install -m 755 "$tmp_dir/realm" "$REALM_BIN"
+    rm -rf "$tmp_dir"
+
+    mkdir -p "$REALM_CFG_DIR"
+    _realm_write_service
+    svc_daemon_reload
+    log_ok "$(t realm.install_done "$tag")"
+}
+
+_realm_write_service() {
+    if ! _uses_systemd; then
+        psm_write_openrc_service realm "realm relay service" "$REALM_BIN" "-c $REALM_TOML"
+        return
+    fi
+    cat > "$REALM_SERVICE" <<EOF
+[Unit]
+Description=realm relay service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+ExecStart=${REALM_BIN} -c ${REALM_TOML}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# ── 端口 / 主机校验 ───────────────────────────────────────────────────────────
+_realm_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# ── 添加中转规则 ──────────────────────────────────────────────────────────────
+realm_add_rule() {
+    log_step "$(t realm.adding)"
+    echo -e "  ${YELLOW}$(t realm.add.desc1)"
+    echo -e "  $(t realm.add.desc2)${NC}\n"
+
+    local count; count=$(_realm_count)
+    local tag listen_port remote_host remote_port
+    ask tag "$(t realm.ask.tag)" "relay-$((count + 1))"
+    local exist; exist=$(_realm_get_by_tag "$tag")
+    [[ -n "$exist" ]] && { log_error "$(t realm.tag_exists "$tag")"; return 1; }
+
+    ask listen_port "$(t realm.ask.listen_port)" "$(rand_port 20000 60000)"
+    _realm_valid_port "$listen_port" || { log_error "$(t realm.invalid_port)"; return 1; }
+    # 与已有规则的监听端口冲突会导致 realm 整体起不来，提前拦截。
+    if _realm_load | jq -e --argjson p "$listen_port" 'any(.[]; .listen_port == $p)' >/dev/null 2>&1; then
+        log_error "$(t realm.listen_port_used "$listen_port")"; return 1
+    fi
+    _realm_port_conflict_warn "$listen_port"
+
+    ask remote_host "$(t realm.ask.remote_host)"
+    [[ -z "$remote_host" ]] && { log_error "$(t realm.remote_host_empty)"; return 1; }
+    ask remote_port "$(t realm.ask.remote_port)" "443"
+    _realm_valid_port "$remote_port" || { log_error "$(t realm.invalid_port)"; return 1; }
+
+    local udp=false
+    ask_yn "$(t realm.ask.udp)" N && udp=true
+
+    local rule
+    rule=$(jq -n \
+        --arg tag "$tag" \
+        --argjson lp "$listen_port" \
+        --arg rh "$remote_host" \
+        --argjson rp "$remote_port" \
+        --argjson udp "$udp" \
+        '{tag:$tag, listen_port:$lp, remote_host:$rh, remote_port:$rp, udp:$udp}')
+    _realm_upsert "$rule"
+    _realm_apply || return 1
+
+    echo ""
+    log_ok "$(t realm.rule_added "$tag" "$listen_port" "$remote_host" "$remote_port")"
+
+    local proto; [[ "$udp" == "true" ]] && proto="both" || proto="tcp"
+    ask_yn "$(t realm.ask.open_firewall "$listen_port" "$proto")" Y && {
+        source "$LIB_DIR/system.sh"
+        firewall_open_port "$listen_port" "$proto"
+    }
+}
+
+# 监听端口若与本机已知服务/其它节点冲突则给出提示（不强制阻止）。
+_realm_port_probe_warn() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -ltnu 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${port}$" \
+            && log_warn "$(t realm.port_listening_warn "$port")"
+    fi
+}
+
+# 复用蜜罐/其它协议已登记的端口检测（若可用），并做一次实时监听探测。
+_realm_port_conflict_warn() {
+    local port="$1"
+    if source "$LIB_DIR/security/honeypot.sh" 2>/dev/null \
+       && declare -f _hp_is_reserved_port &>/dev/null \
+       && _hp_is_reserved_port "$port"; then
+        log_warn "$(t realm.port_reserved_warn "$port")"
+    fi
+    _realm_port_probe_warn "$port"
+}
+
+# ── 删除中转规则 ──────────────────────────────────────────────────────────────
+realm_delete_rule() {
+    _realm_show_rules
+    local count; count=$(_realm_count)
+    (( count == 0 )) && return 0
+    local tag; ask tag "$(t realm.ask.delete_tag)"
+    local rule; rule=$(_realm_get_by_tag "$tag")
+    [[ -z "$rule" ]] && { log_error "$(t realm.rule_not_found "$tag")"; return 1; }
+    _realm_is_gost "$rule" && { log_error "$(t realm.gost_rule "$tag")"; return 1; }
+    local lp; lp=$(echo "$rule" | jq -r '.listen_port')
+    ask_yn "$(t realm.ask.delete_rule "$tag" "$lp")" N || return 0
+    _realm_delete "$tag"
+    _realm_apply
+    log_info "$(t realm.rule_deleted "$tag" "$lp")"
+}
+
+# ── 修改中转规则 ──────────────────────────────────────────────────────────────
+realm_modify_rule() {
+    _realm_show_rules
+    local count; count=$(_realm_count)
+    (( count == 0 )) && return 0
+    local tag; ask tag "$(t realm.ask.modify_tag)"
+    local rule; rule=$(_realm_get_by_tag "$tag")
+    [[ -z "$rule" ]] && { log_error "$(t realm.rule_not_found "$tag")"; return 1; }
+    _realm_is_gost "$rule" && { log_error "$(t realm.gost_rule "$tag")"; return 1; }
+
+    local old_lp old_rh old_rp old_udp
+    old_lp=$(echo "$rule"  | jq -r '.listen_port')
+    old_rh=$(echo "$rule"  | jq -r '.remote_host')
+    old_rp=$(echo "$rule"  | jq -r '.remote_port')
+    old_udp=$(echo "$rule" | jq -r '.udp')
+
+    local listen_port remote_host remote_port
+    ask listen_port "$(t realm.ask.listen_port)" "$old_lp"
+    _realm_valid_port "$listen_port" || { log_error "$(t realm.invalid_port)"; return 1; }
+    if [[ "$listen_port" != "$old_lp" ]] \
+       && _realm_load | jq -e --arg t "$tag" --argjson p "$listen_port" \
+            'any(.[]; .tag != $t and .listen_port == $p)' >/dev/null 2>&1; then
+        log_error "$(t realm.listen_port_used "$listen_port")"; return 1
+    fi
+    ask remote_host "$(t realm.ask.remote_host)" "$old_rh"
+    [[ -z "$remote_host" ]] && { log_error "$(t realm.remote_host_empty)"; return 1; }
+    ask remote_port "$(t realm.ask.remote_port)" "$old_rp"
+    _realm_valid_port "$remote_port" || { log_error "$(t realm.invalid_port)"; return 1; }
+
+    local udp="$old_udp"
+    if [[ "$old_udp" == "true" ]]; then
+        ask_yn "$(t realm.ask.keep_udp)" Y && udp=true || udp=false
+    else
+        ask_yn "$(t realm.ask.udp)" N && udp=true || udp=false
+    fi
+
+    rule=$(echo "$rule" | jq \
+        --argjson lp "$listen_port" --arg rh "$remote_host" \
+        --argjson rp "$remote_port" --argjson udp "$udp" \
+        '.listen_port=$lp | .remote_host=$rh | .remote_port=$rp | .udp=$udp
+         | if ((.targets // []) | length) > 0 then .targets = ([{host: $rh, port: $rp}] + .targets[1:]) else . end')
+    _realm_upsert "$rule"
+    _realm_apply || return 1
+    log_ok "$(t realm.rule_updated "$tag" "$listen_port" "$remote_host" "$remote_port")"
+
+    if [[ "$listen_port" != "$old_lp" ]]; then
+        local proto; [[ "$udp" == "true" ]] && proto="both" || proto="tcp"
+        ask_yn "$(t realm.ask.open_new_port "$listen_port" "$proto")" Y && {
+            source "$LIB_DIR/system.sh"
+            firewall_open_port "$listen_port" "$proto"
+        }
+        log_info "$(t realm.old_port_note "$old_lp")"
+    fi
+}
+
+# ── 显示规则列表 ──────────────────────────────────────────────────────────────
+_realm_show_rules() {
+    local lst; lst=$(_realm_list)
+    if [[ -z "$lst" ]]; then
+        log_warn "$(t realm.no_rules)"
+        return 1
+    fi
+    local ip; ip=$(get_ipv4 2>/dev/null || echo "?")
+    echo -e "\n${BOLD}$(t realm.rules_title "$ip")${NC}"
+    printf "  %-16s %-10s %-28s %s\n" "$(t realm.header.tag)" "$(t realm.header.local_port)" "$(t realm.header.remote)" "$(t realm.header.proto)"
+    echo "$lst" | while IFS=$'\t' read -r tag lp rh rp proto; do
+        printf "  %-16s %-10s %-28s %s\n" "$tag" "$lp" "${rh}:${rp}" "$proto"
+    done
+}
+
+# ── 供 manager.sh 节点总览调用 ────────────────────────────────────────────────
+_realm_show_node_list() {
+    echo -e "\n${BOLD}$(t realm.node_title)${NC}"
+    local count; count=$(_realm_count 2>/dev/null || echo 0)
+    if [[ "$count" == "0" || -z "$count" ]]; then
+        echo "  $(t common.not_configured)"
+        return
+    fi
+    local ip; ip=$(get_ipv4 2>/dev/null || echo "?")
+    _realm_list | while IFS=$'\t' read -r tag lp rh rp proto; do
+        printf "  %s %s:%s → %s:%s\n" "$proto" "$ip" "$lp" "$rh" "$rp"
+    done
+}
+
+# ── 卸载 ──────────────────────────────────────────────────────────────────────
+realm_uninstall() {
+    ask_yn "$(t realm.ask_uninstall)" N || return 0
+    svc_stop realm 2>/dev/null || true
+    svc_disable realm || true
+    psm_remove_openrc_service realm
+    rm -f "$REALM_BIN" "$REALM_SERVICE"
+    rm -rf "$REALM_CFG_DIR"
+    rm -f "$REALM_STORE"
+    svc_daemon_reload
+    log_ok "$(t realm.uninstalled)"
+}
+
+realm_logs() { svc_logs realm; }
+
+# ── 状态报告（资源 / 网速 / 延迟；与 Telegram /relay 同源）────────────────────
+realm_status_report() {
+    source "$LIB_DIR/tgbot/relay_status.sh" 2>/dev/null \
+        || { log_error "$(t realm.report_load_fail)"; return 1; }
+    log_step "$(t realm.report.collecting)"
+    local report; report=$(rs_build_report)
+    # 终端显示时剥掉 Telegram Markdown 标记
+    echo ""
+    printf '%s\n' "$report" | sed -e 's/[*`]//g' -e 's/\\\[/[/g'
+    echo ""
+    if [[ -f "$CFG_DIR/tg_bot.conf" ]]; then
+        ask_yn "$(t realm.report.ask_push)" N || return 0
+        source "$LIB_DIR/tgbot/notify.sh" 2>/dev/null || return 0
+        tg_notify_admins "$report"
+        log_ok "$(t realm.report.pushed)"
+    else
+        log_info "$(t realm.report.tg_hint)"
+    fi
+}
+
+# ── 依赖检查 ──────────────────────────────────────────────────────────────────
+_realm_check_deps() {
+    ensure_pkg_deps curl tar jq
+    [[ -f "$REALM_BIN" ]] && return 0
+    log_warn "$(t realm.not_installed)"
+    ask_yn "$(t realm.ask_install_now)" Y \
+        && realm_install \
+        || { log_error "$(t realm.menu_required)"; return 1; }
+}
+
+# ── 菜单 ──────────────────────────────────────────────────────────────────────
+realm_menu() {
+    _realm_check_deps || return
+    while true; do
+        show_menu "$(t realm.menu.title)" \
+            "$(t realm.menu.install)" \
+            "$(t realm.menu.add)" \
+            "$(t realm.menu.modify)" \
+            "$(t realm.menu.delete)" \
+            "$(t realm.menu.list)" \
+            "$(t realm.menu.report)" \
+            "$(t realm.menu.status)" \
+            "$(t realm.menu.restart)" \
+            "$(t realm.menu.logs)" \
+            "$(t realm.menu.uninstall)"
+
+        case "$MENU_CHOICE" in
+            1)  realm_install ;;
+            2)  realm_add_rule ;;
+            3)  realm_modify_rule ;;
+            4)  realm_delete_rule ;;
+            5)  _realm_show_rules ;;
+            6)  realm_status_report ;;
+            7)  svc_status realm ;;
+            8)  svc_restart realm && log_ok "$(t realm.restarted)" ;;
+            9)  realm_logs ;;
+            10) realm_uninstall ;;
+            0)  return ;;
+        esac
+        press_enter
+    done
+}

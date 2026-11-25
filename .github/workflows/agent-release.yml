@@ -1,0 +1,38 @@
+name: psm-agent release
+
+# A tag agent-vX.Y.Z publishes psm-agent X.Y.Z for linux amd64 / arm64 / armv7
+# with SHA256SUMS. setup.sh (panel/scripts/bundle.sh) uses it on a machine
+# without Go; servers get psm-agent from the panel either way.
+on:
+  push:
+    tags: ['agent-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: stack/agent/go.mod
+      - name: the tag names this version
+        run: |
+          want="${GITHUB_REF_NAME#agent-v}"
+          have=$(sed -n 's/^const agentVersion = "\(.*\)"/\1/p' stack/agent/main.go)
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME, but agentVersion is $have"; exit 1; }
+      - name: build
+        working-directory: stack/agent
+        run: |
+          mkdir -p ../../dist
+          for t in amd64:amd64 arm64:arm64 arm:armv7; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=${t%%:*} GOARM=7 go build -trimpath -ldflags "-s -w" -o ../../dist/psm-agent-linux-${t##*:} .
+          done
+          cd ../../dist && sha256sum psm-agent-linux-* > SHA256SUMS && cat SHA256SUMS
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "psm-agent ${GITHUB_REF_NAME#agent-v}" --notes "psm-agent for roomkey servers (linux amd64, arm64, armv7), with SHA256SUMS."

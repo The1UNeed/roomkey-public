@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# uninstall.sh — PSM full uninstall
+
+set -euo pipefail
+
+PSM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$PSM_ROOT/lib"
+
+source "$LIB_DIR/common.sh"
+
+require_root
+
+echo -e "\n${RED}${BOLD}$(t uninstall.title)${NC}"
+echo -e "${YELLOW}$(t uninstall.warn1)${NC}"
+echo -e "${YELLOW}$(t uninstall.warn2 "$PSM_ROOT")${NC}\n"
+
+ask_yn "$(t uninstall.confirm)" N || { log_info "$(t common.cancelled)"; exit 0; }
+
+# Hysteria2 port-hopping redirects and their boot hook (lib/hop.sh)
+if source "$(dirname "${BASH_SOURCE[0]}")/lib/hop.sh" 2>/dev/null; then
+    _hop_flush; _hop_boot_hook_remove
+fi
+
+_systemctl_disable_now() {
+    local unit="$1"
+    systemctl disable --now "$unit" 2>/dev/null || true
+}
+
+# Stop + disable on either init system; on OpenRC also delete PSM's init script.
+_svc_stop_disable() {
+    local unit="$1"
+    svc_stop "$unit" &>/dev/null || true
+    svc_disable "$unit" &>/dev/null || true
+}
+
+_remove_systemd_units() {
+    local unit
+    for unit in "$@"; do
+        rm -f "/etc/systemd/system/$unit"
+    done
+}
+
+_compose_down_all() {
+    local compose_file
+    [[ -d /opt/psm/compose ]] || return 0
+    command -v docker &>/dev/null || command -v docker-compose &>/dev/null || return 0
+    while IFS= read -r compose_file; do
+        if docker compose version &>/dev/null 2>&1; then
+            docker compose -f "$compose_file" down 2>/dev/null || true
+        elif command -v docker-compose &>/dev/null; then
+            docker-compose -f "$compose_file" down 2>/dev/null || true
+        fi
+    done < <(find /opt/psm/compose -name docker-compose.yml -type f 2>/dev/null)
+}
+
+_remove_psm_iptables() {
+    local ipt port
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" &>/dev/null || continue
+        while "$ipt" -D INPUT -j PSM_TRF 2>/dev/null; do :; done
+        while "$ipt" -D OUTPUT -j PSM_TRF 2>/dev/null; do :; done
+        "$ipt" -F PSM_TRF 2>/dev/null || true
+        "$ipt" -X PSM_TRF 2>/dev/null || true
+
+        while IFS= read -r port; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            "$ipt" -D INPUT -p tcp --dport "$port" -j LOG --log-prefix "PSM-HONEYPOT: " --log-level 4 2>/dev/null || true
+            "$ipt" -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null || true
+        done < <("$ipt" -S INPUT 2>/dev/null | awk '/PSM-HONEYPOT/ {for (i=1; i<=NF; i++) if ($i == "--dport") print $(i+1)}' || true)
+    done
+}
+
+# ── Optional component removal ────────────────────────────────────────────────
+# psm-agent (a server in a PSM panel): without PSM it would go on syncing with
+# the panel and fail every task, so it goes first — asked, default yes.
+if source "$LIB_DIR/agent.sh" 2>/dev/null && { [[ -x "$PSM_AGENT_BIN" ]] || [[ -f "$PSM_AGENT_CFG" ]]; }; then
+    agent_panel=$(jq -r '.panel // ""' "$PSM_AGENT_CFG" 2>/dev/null || true)
+    ask_yn "$(t uninstall.ask_agent "${agent_panel:-?}")" Y && {
+        _agent_remove --yes >/dev/null 2>&1 || true
+        log_ok "$(t uninstall.agent_removed)"
+    }
+fi
+
+# nginx's start check runs PSM's script: it goes with PSM (a kept nginx
+# would otherwise fail to start once the script is gone)
+if [[ -f /etc/systemd/system/nginx.service.d/psm-forwards.conf ]]; then
+    rm -f /etc/systemd/system/nginx.service.d/psm-forwards.conf
+    rmdir /etc/systemd/system/nginx.service.d 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+fi
+
+ask_yn "$(t uninstall.ask_nginx)" N && {
+    _svc_stop_disable nginx
+    detect_os
+    case "$OS_ID" in
+        alpine)
+            apk del nginx nginx-mod-stream 2>/dev/null || true ;;
+        ubuntu|debian|raspbian)
+            apt-get purge -y nginx nginx-common 2>/dev/null || true ;;
+        centos|rhel|rocky|almalinux|ol|amzn|fedora)
+            "$(_rhel_pkg_cmd)" remove -y nginx 2>/dev/null || true ;;
+    esac
+    rm -rf /etc/nginx
+    log_ok "$(t uninstall.nginx_removed)"
+}
+
+ask_yn "$(t uninstall.ask_xray)" N && {
+    _svc_stop_disable xray
+    rm -f /usr/local/bin/xray /etc/systemd/system/xray.service
+    psm_remove_openrc_service xray
+    rm -rf "$XRAY_CFG_DIR" /var/log/xray /usr/local/share/xray
+    svc_daemon_reload
+    log_ok "$(t uninstall.xray_removed)"
+}
+
+ask_yn "$(t uninstall.ask_singbox)" N && {
+    _svc_stop_disable sing-box
+    rm -f "$SINGBOX_BIN" /etc/systemd/system/sing-box.service
+    psm_remove_openrc_service sing-box
+    rm -rf "$SINGBOX_CFG_DIR"
+    svc_daemon_reload
+    log_ok "$(t uninstall.singbox_removed)"
+}
+
+ask_yn "$(t uninstall.ask_mihomo)" N && {
+    _svc_stop_disable mihomo
+    rm -f "$MIHOMO_BIN" /etc/systemd/system/mihomo.service
+    psm_remove_openrc_service mihomo
+    rm -rf "$MIHOMO_CFG_DIR" "$CFG_DIR/mihomo"
+    svc_daemon_reload
+    log_ok "$(t uninstall.mihomo_removed)"
+}
+
+ask_yn "$(t uninstall.ask_hy2)" N && {
+    _svc_stop_disable hysteria-server
+    rm -f /usr/local/bin/hysteria /etc/systemd/system/hysteria-server.service
+    psm_remove_openrc_service hysteria-server
+    rm -rf /etc/hysteria
+    svc_daemon_reload
+    log_ok "$(t uninstall.hy2_removed)"
+}
+
+ask_yn "$(t uninstall.ask_snell)" N && {
+    systemctl stop snell snell.socket snell-netns 2>/dev/null || true
+    systemctl disable snell snell.socket snell-netns 2>/dev/null || true
+    psm_remove_openrc_service snell
+    # Alpine installs Snell as the jinqians/snell-server image (lib/snell.sh)
+    if command -v docker &>/dev/null; then
+        docker rm -f psm-snell &>/dev/null || true
+        docker rmi jinqians/snell-server:v5 &>/dev/null || true
+    fi
+    rm -f /usr/local/bin/snell-server /usr/local/bin/snell
+    _remove_systemd_units snell.service snell.socket snell-netns.service
+    rm -rf /etc/snell
+    svc_daemon_reload
+    log_ok "$(t uninstall.snell_removed)"
+}
+
+ask_yn "$(t uninstall.ask_ssrust)" N && {
+    _svc_stop_disable ss-rust
+    rm -f /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
+    psm_remove_openrc_service ss-rust
+    rm -rf /etc/ss-rust
+    svc_daemon_reload
+    log_ok "$(t uninstall.ssrust_removed)"
+}
+
+ask_yn "$(t uninstall.ask_realm)" N && {
+    _svc_stop_disable realm
+    rm -f /usr/local/bin/realm /etc/systemd/system/realm.service
+    psm_remove_openrc_service realm
+    rm -rf /etc/realm
+    svc_daemon_reload
+    log_ok "$(t uninstall.realm_removed)"
+}
+
+# gost (psm relay --engine gost), asked about only when it is there
+if [[ -e /usr/local/bin/psm-gost || -d /etc/psm-gost ]]; then
+    ask_yn "$(t uninstall.ask_gost)" N && {
+        _svc_stop_disable psm-gost
+        rm -f /usr/local/bin/psm-gost /etc/systemd/system/psm-gost.service
+        psm_remove_openrc_service psm-gost
+        rm -rf /etc/psm-gost
+        svc_daemon_reload
+        log_ok "$(t uninstall.gost_removed)"
+    }
+fi
+
+ask_yn "$(t uninstall.ask_docker)" N && {
+    _compose_down_all
+    rm -rf /opt/psm/compose
+    log_ok "$(t uninstall.docker_removed)"
+}
+
+ask_yn "$(t uninstall.ask_acme "$NGINX_SSL_DIR")
+  ${YELLOW}$(t uninstall.ask_acme_warn)${NC}" N && {
+    # 删除前先把 acme.sh 账户与证书缓存打包备份，避免重装后重新签发触发限流
+    if [[ -d "$ACME_HOME" ]]; then
+        mkdir -p "$BAK_DIR"
+        acme_bak="$BAK_DIR/acme-home-$(date +%Y%m%d-%H%M%S).tar.gz"
+        if tar -czf "$acme_bak" -C "$(dirname "$ACME_HOME")" "$(basename "$ACME_HOME")" 2>/dev/null; then
+            log_ok "$(t uninstall.acme_backed_up "$acme_bak")"
+        else
+            log_warn "$(t uninstall.acme_backup_fail)" || true
+        fi
+    fi
+    [[ -f "$ACME_HOME/acme.sh" ]] && "$ACME_HOME/acme.sh" --uninstall
+    rm -rf "$ACME_HOME"
+    log_ok "$(t uninstall.acme_removed)"
+}
+
+ask_yn "$(t uninstall.ask_certs "$NGINX_SSL_DIR")" N && {
+    rm -rf "$NGINX_SSL_DIR"
+    log_ok "$(t uninstall.certs_removed)"
+}
+
+# Remove crons and PSM-owned systemd units (on OpenRC: cron drop-ins + init scripts).
+rm -f /etc/cron.d/psm-backup /etc/cron.d/psm-ddns \
+      /etc/cron.d/psm-traffic /etc/cron.d/psm-ruleset-update /etc/cron.d/psm-reality-watchdog \
+      /etc/cron.d/psm-health-report /etc/cron.d/psm-vpngate-watchdog /etc/local.d/psm-traffic.stop
+psm_remove_openrc_service psm-tgbot
+psm_remove_openrc_service psm-vpngate
+_systemctl_disable_now psm-reality-watchdog.timer
+_systemctl_disable_now psm-vpngate-watchdog.timer
+_systemctl_disable_now psm-ruleset-update.timer
+_systemctl_disable_now psm-vpngate.service
+_systemctl_disable_now psm-health-report.timer
+_systemctl_disable_now psm-traffic.timer
+_systemctl_disable_now psm-traffic-shutdown.service
+_systemctl_disable_now psm-tgbot.service
+# The unprivileged core user (lib/coreperm.sh); only once no core uses it any more
+if id -u psm-core &>/dev/null && ! pgrep -u psm-core >/dev/null 2>&1; then
+    userdel psm-core 2>/dev/null || deluser psm-core 2>/dev/null || true
+    groupdel psm-core 2>/dev/null || delgroup psm-core 2>/dev/null || true
+fi
+_remove_systemd_units \
+    psm-reality-watchdog.service psm-reality-watchdog.timer \
+    psm-vpngate.service psm-vpngate-watchdog.service psm-vpngate-watchdog.timer \
+    psm-ruleset-update.service psm-ruleset-update.timer \
+    psm-health-report.service psm-health-report.timer \
+    psm-traffic.service psm-traffic.timer psm-traffic-shutdown.service \
+    psm-tgbot.service
+# Remove rule-set files written into the cores' own config directories
+rm -rf /etc/sing-box/rulesets /etc/mihomo/rules
+# Remove the VPNGate residential-exit tunnel: openvpn config plus the policy
+# routing it installed (dedicated table + ip rules; the main table was never touched).
+rm -f /etc/openvpn/psm-vpngate.conf /etc/openvpn/psm-vpngate.auth \
+      /etc/openvpn/psm-vpngate-up.sh /etc/openvpn/psm-vpngate-down.sh
+# 输出先收进变量再 grep：管道里的 grep -q 会让 ip 吃到 SIGPIPE，本脚本开了
+# pipefail，会把「还有规则」误判成「已经删干净」。
+_psm_vg_rules() { ip "$@" rule list 2>/dev/null || true; }
+while grep -q "lookup 8433" <<<"$(_psm_vg_rules -4)"; do
+    ip rule del lookup 8433 2>/dev/null || break
+done
+while grep -q "lookup 8433" <<<"$(_psm_vg_rules -6)"; do
+    ip -6 rule del lookup 8433 2>/dev/null || break
+done
+ip route flush table 8433 2>/dev/null || true
+ip -6 route flush table 8433 2>/dev/null || true
+# Remove symlink
+rm -f /usr/local/bin/psm
+# Remove sysctl / limits files
+rm -f /etc/sysctl.d/99-psm.conf /etc/sysctl.d/99-bbr.conf /etc/security/limits.d/99-psm.conf
+# Remove PSM iptables accounting/honeypot rules + fail2ban wiring (leaves already-banned IPs banned)
+if [[ -f "$CFG_DIR/security/honeypot.conf" ]]; then
+    source "$LIB_DIR/security/honeypot.sh" 2>/dev/null && hp_remove_rules 2>/dev/null || true
+fi
+_remove_psm_iptables
+rm -f /etc/fail2ban/filter.d/psm-honeypot.conf /etc/fail2ban/action.d/psm-honeypot-alert.conf \
+      /etc/fail2ban/jail.d/psm-honeypot.conf
+command -v fail2ban-client &>/dev/null && fail2ban-client reload &>/dev/null || true
+# Remove fail2ban SSH/recidive/whitelist wiring installed via 安全加固 → Fail2ban
+rm -f /etc/fail2ban/jail.d/psm-sshd.conf /etc/fail2ban/jail.d/psm-recidive.conf \
+      /etc/fail2ban/jail.d/psm-defaults.conf
+# Remove the local cloudflared service (does not delete the Tunnel/DNS records
+# on Cloudflare's side — that needs network access and is left for the admin
+# to do from 「Cloudflare 管理 → Tunnel → 卸载 Tunnel」 while credentials are handy)
+systemctl stop cloudflared 2>/dev/null || true
+command -v cloudflared &>/dev/null && cloudflared service uninstall 2>/dev/null || true
+
+systemctl daemon-reload 2>/dev/null || true
+
+psm_root_removed=0
+if ask_yn "$(t uninstall.ask_progdir "$PSM_ROOT")" Y; then
+    # the backups live inside the program directory: keep them, unless asked not to
+    if [[ -d "$BAK_DIR" && -n "$(ls -A "$BAK_DIR" 2>/dev/null)" ]]; then
+        kept_bak="/root/psm-backup-$(date +%Y%m%d-%H%M%S)"
+        if ask_yn "$(t uninstall.ask_keep_backups "$BAK_DIR" "$kept_bak")" Y && mv "$BAK_DIR" "$kept_bak"; then
+            chmod 700 "$kept_bak" 2>/dev/null || true
+            log_ok "$(t uninstall.backups_kept "$kept_bak")"
+        fi
+    fi
+    rm -rf "$PSM_ROOT"
+    psm_root_removed=1
+else
+    ask_yn "$(t uninstall.ask_cfg "$CFG_DIR")" N && {
+        rm -rf "$CFG_DIR"
+        log_ok "$(t uninstall.cfg_removed)"
+    }
+fi
+
+log_ok "$(t uninstall.done)"
+if (( psm_root_removed )); then
+    echo -e "  $(t uninstall.removed_label)${YELLOW}$PSM_ROOT${NC}"
+else
+    echo -e "  $(t uninstall.kept_label)${YELLOW}$PSM_ROOT${NC}"
+fi

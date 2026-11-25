@@ -1,0 +1,30 @@
+# Runtime state (may contain credentials/passwords)
+# Ignore the whole directory so a new protocol store cannot accidentally leak
+# UUIDs, passwords, tokens, or private keys before .gitignore is updated.
+config/
+.psm-users.lock
+
+# Backup archives
+backup/
+*.tar.gz
+
+# Logs
+logs/
+
+# psm-agent build output (released binaries are built by CI, never committed)
+agent/psm-agent
+agent/psm-agent-*
+
+# Control-plane runtime data and Python bytecode
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Local dev notes (keep out of the public repo). Tests and CI are public:
+# tests/, scripts/ci.sh and .github/workflows run on every push.
+docs/
+# local builds of psm-agent (releases are built by .github/workflows/agent-release.yml)
+/agent/agent
+/agent/psm-agent

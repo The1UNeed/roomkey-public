@@ -1,0 +1,991 @@
+#!/usr/bin/env bash
+# tg_bot.sh — PSM Telegram Bot: traffic query via Telegram
+
+if [[ -z "${PSM_ROOT:-}" ]]; then
+    _D="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    source "$_D/common.sh"
+    unset _D
+fi
+
+# Expiry module (non-fatal if missing)
+source "$(dirname "${BASH_SOURCE[0]}")/expiry/core.sh" 2>/dev/null || true
+
+TG_BOT_CFG="${CFG_DIR}/tg_bot.conf"
+TG_BOT_OFFSET="${CFG_DIR}/tg_bot.offset"
+TG_BOT_SVC="/etc/systemd/system/psm-tgbot.service"
+TG_API_BASE="https://api.telegram.org/bot"
+TG_USERS_FILE="${CFG_DIR}/tg_users.json"      # tenant uid → port bindings
+BIND_TOKENS_FILE="${CFG_DIR}/bind_tokens.json" # port → bind token
+TG_BOT_CONFLICT="${CFG_DIR}/tg_bot.conflict"   # when this token was last seen polled elsewhere
+TG_BOT_CONFLICT_SAID="${CFG_DIR}/tg_bot.conflict-said"   # when the admins were last told
+TG_BOT_USERNAME=""   # this bot's @name (getMe, at the daemon's start): commands in a group
+TG_SERVER_LABEL=""   # which server answers: hostname and IPv4, at the daemon's start
+
+# ── Config helpers ─────────────────────────────────────────────────────────────
+_tgbot_load_cfg() {
+    [[ -f "$TG_BOT_CFG" ]] || { log_error "$(t tgbot.cfg.not_configured)"; return 1; }
+    # shellcheck source=/dev/null
+    source "$TG_BOT_CFG"
+    [[ -n "${TG_BOT_TOKEN:-}" ]] || { log_error "$(t tgbot.cfg.token_unset)"; return 1; }
+    # Backward compat: old configs used TG_ALLOWED_IDS for admins
+    if [[ -z "${TG_ADMIN_IDS:-}" && -n "${TG_ALLOWED_IDS:-}" ]]; then
+        TG_ADMIN_IDS="$TG_ALLOWED_IDS"
+    fi
+}
+
+_tgbot_save_cfg() {
+    mkdir -p "$CFG_DIR"
+    cat > "$TG_BOT_CFG" <<EOF
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_ADMIN_IDS="${TG_ADMIN_IDS:-}"
+EOF
+    chmod 600 "$TG_BOT_CFG"
+}
+
+# ── Telegram API ───────────────────────────────────────────────────────────────
+_tgbot_api() {
+    local method="$1"; shift
+    curl -fsSL --max-time 35 \
+        "${TG_API_BASE}${TG_BOT_TOKEN}/${method}" "$@" 2>/dev/null
+}
+
+# Through notify.sh's tg_send: a reply Telegram cannot parse as Markdown (an
+# unpaired _ in a node tag) goes again as plain text instead of nowhere.
+_tgbot_send() {
+    declare -f tg_send >/dev/null || source "$LIB_DIR/tgbot/notify.sh"
+    tg_send "$1" "$2"
+}
+
+# ── One bot, one server ────────────────────────────────────────────────────────
+# Telegram hands each of a bot's messages to one getUpdates poller, and a second
+# poller with the same token (the same bot on another server) makes it answer
+# 409 to the first. Several servers sharing a bot each answer a random part of
+# the commands — /list showing one server's nodes (#14). A server that sees the
+# 409 says so: in the journal, in the menu, and once a day to the admins.
+_tgbot_conflict() {
+    local now last
+    now=$(date +%s)
+    echo "$now" > "$TG_BOT_CONFLICT"
+    last=$(cat "$TG_BOT_CONFLICT_SAID" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last < 86400 )) && return 0
+    echo "$now" > "$TG_BOT_CONFLICT_SAID"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $(t tgbot.conflict.log)" >&2
+    declare -f tg_notify_admins >/dev/null || source "$LIB_DIR/tgbot/notify.sh"
+    tg_notify_admins "$(t tgbot.conflict.notify "${TG_SERVER_LABEL:-$(hostname)}")"
+}
+
+_tgbot_conflict_recent() {   # seen in the last 10 minutes
+    local seen; seen=$(cat "$TG_BOT_CONFLICT" 2>/dev/null || echo 0)
+    [[ "$seen" =~ ^[0-9]+$ ]] && (( $(date +%s) - seen < 600 ))
+}
+
+# The text of a message this bot should act on, on stdout; status 1 for one it
+# should leave alone. In a group (several servers' bots in one, privacy mode
+# off, so every bot gets every message) that is a command, for no bot in
+# particular (/list) or for this one (/list@this_bot): each server answers
+# for itself, and chatter and other bots' commands get no reply.
+_tgbot_own_text() {   # <chat type> <text>
+    local type="$1" text="$2" first rest at
+    first=${text%%[[:space:]]*}; rest=${text#"$first"}
+    if [[ "$first" == /*@* ]]; then
+        at=${first#*@}; first=${first%%@*}
+        [[ -z "$TG_BOT_USERNAME" || "${at,,}" == "${TG_BOT_USERNAME,,}" ]] || return 1
+    fi
+    if [[ "$type" == group || "$type" == supergroup ]]; then
+        [[ "$first" == /* ]] || return 1
+    fi
+    printf '%s' "$first$rest"
+}
+
+# Send a message with an inline keyboard.
+# $3 = JSON string for reply_markup (inline_keyboard)
+_tgbot_send_kb() {
+    local chat_id="$1" text="$2" keyboard="$3"
+    _tgbot_api sendMessage \
+        -d "chat_id=${chat_id}" \
+        -d "parse_mode=Markdown" \
+        -d "disable_web_page_preview=true" \
+        --data-urlencode "text=${text}" \
+        --data-urlencode "reply_markup=${keyboard}" >/dev/null
+}
+
+# Acknowledge a callback_query (required; otherwise the button spins forever).
+_tgbot_answer_cb() {
+    _tgbot_api answerCallbackQuery \
+        -d "callback_query_id=${1}" >/dev/null
+}
+
+# ── Inline keyboard layouts ────────────────────────────────────────────────────
+_tgbot_kb_admin() {
+    printf '%s' \
+      '{"inline_keyboard":['\
+        '[{"text":"'"$(t tgbot.kb.admin.nodes)"'","callback_data":"admin:list"},'\
+         '{"text":"'"$(t tgbot.kb.admin.users)"'","callback_data":"admin:users"}],'\
+        '[{"text":"'"$(t tgbot.kb.admin.relay)"'","callback_data":"admin:relay"},'\
+         '{"text":"'"$(t tgbot.kb.admin.help)"'","callback_data":"admin:help"}]'\
+      ']}'
+}
+
+# 中转状态报告：采样 + 逐规则探测需要几秒，先回一条提示再发结果。
+_tgbot_cmd_relay() {
+    local chat_id="$1"
+    source "$LIB_DIR/tgbot/relay_status.sh" 2>/dev/null || {
+        _tgbot_send "$chat_id" "$(t tgbot.relay.module_failed)"; return
+    }
+    _tgbot_send "$chat_id" "$(t tgbot.relay.collecting)"
+    _tgbot_send "$chat_id" "$(rs_build_report)"
+}
+
+_tgbot_kb_tenant() {
+    printf '%s' \
+      '{"inline_keyboard":['\
+        '[{"text":"'"$(t tgbot.kb.tenant.traffic)"'","callback_data":"tenant:mytraffic"}],'\
+        '[{"text":"'"$(t tgbot.kb.tenant.refresh)"'","callback_data":"tenant:mytraffic"}]'\
+      ']}'
+}
+
+# ── Callback handler ───────────────────────────────────────────────────────────
+_tgbot_handle_callback() {
+    local cb_id="$1" chat_id="$2" user_id="$3" data="$4"
+    _tgbot_answer_cb "$cb_id"   # must always ack
+
+    if _tgbot_is_admin "$user_id"; then
+        case "$data" in
+            admin:list)
+                _tgbot_send "$chat_id" "$(_tgbot_list_nodes)"
+                ;;
+            admin:users)
+                _tgbot_cmd_users "$chat_id"
+                ;;
+            admin:relay)
+                _tgbot_cmd_relay "$chat_id"
+                ;;
+            admin:help)
+                _tgbot_send_kb "$chat_id" \
+                    "$(t tgbot.help.callback_admin)" \
+                    "$(_tgbot_kb_admin)"
+                ;;
+        esac
+        return
+    fi
+
+    local tenant_port; tenant_port=$(_tgbot_tenant_port "$user_id")
+    if [[ -n "$tenant_port" ]]; then
+        case "$data" in
+            tenant:mytraffic)
+                _tgbot_send_kb "$chat_id" \
+                    "$(_tgbot_query_port "$tenant_port")" \
+                    "$(_tgbot_kb_tenant)"
+                ;;
+        esac
+    fi
+}
+
+# ── Bind-token helpers ────────────────────────────────────────────────────────
+# 绑定 token 直接复用 common.sh 里已经加固过的 rand_str，不再自己拼 tr 管道。
+# 原来那版有两个隐患：head 提前退出让 tr 吃 SIGPIPE（pipefail 下返回 141，裸赋值
+# 会被 errexit 带走整个 Bot 进程）；更要命的是缺了 LC_ALL=C，UTF-8 locale 下 tr 直接
+# 报 "Illegal byte sequence" 退出，生成的是空 token——而空 token 会让下面的绑定校验
+# 整段跳过（见 _tgbot_set_token 的注释），等于管理员以为加了锁、实际门是开的。
+_tgbot_gen_token() { rand_str 12; }
+
+_tgbot_port_token() {
+    local port="$1"
+    [[ -f "$BIND_TOKENS_FILE" ]] || return 0   # no file → no token configured (not an error)
+    # Support both old string format and new object format
+    local t; t=$(jq -r --arg p "$port" \
+        'if (.[$p] | type) == "object" then .[$p].token else .[$p] end // empty' \
+        "$BIND_TOKENS_FILE" 2>/dev/null) || true
+    [[ -n "$t" ]] && printf '%s' "$t"
+    return 0
+}
+
+# 绑定校验是 `if [[ -n "$expected" ]]` —— 空 token 会被当成「这个端口不需要 token」
+# 而直接放行。所以这里必须拒绝空值：存不进去要让上层报错，绝不能悄悄存一个
+# 「看起来上了锁、实际谁都能绑」的端口。
+_tgbot_set_token() {
+    local port="$1" token="$2"
+    [[ -n "$token" ]] || { log_error "$(t tgbot.token.gen_failed)"; return 1; }
+    [[ -f "$BIND_TOKENS_FILE" ]] || echo '{}' > "$BIND_TOKENS_FILE"
+    local tmp; tmp=$(mktemp)
+    jq --arg p "$port" --arg t "$token" \
+        '.[$p] = {"token": $t, "uid": null, "bound_at": null}' \
+        "$BIND_TOKENS_FILE" > "$tmp" && mv "$tmp" "$BIND_TOKENS_FILE"
+}
+
+_tgbot_record_token_uid() {
+    local port="$1" uid="$2"
+    [[ -f "$BIND_TOKENS_FILE" ]] || return 0
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local tmp; tmp=$(mktemp)
+    jq --arg p "$port" --arg u "$uid" --arg ts "$ts" \
+        'if (.[$p] | type) == "object"
+         then .[$p].uid = $u | .[$p].bound_at = $ts
+         else .[$p] = {"token": .[$p], "uid": $u, "bound_at": $ts}
+         end' \
+        "$BIND_TOKENS_FILE" > "$tmp" && mv "$tmp" "$BIND_TOKENS_FILE"
+}
+
+# ── Formatting ─────────────────────────────────────────────────────────────────
+_tgbot_fmt_bytes() {
+    local b="${1:-0}"
+    if   (( b >= 1099511627776 )); then
+        printf "%d.%02d TB" $(( b / 1099511627776 )) \
+               $(( (b % 1099511627776) * 100 / 1099511627776 ))
+    elif (( b >= 1073741824 )); then
+        printf "%d.%02d GB" $(( b / 1073741824 )) \
+               $(( (b % 1073741824) * 100 / 1073741824 ))
+    elif (( b >= 1048576 )); then
+        printf "%d.%02d MB" $(( b / 1048576 )) \
+               $(( (b % 1048576) * 100 / 1048576 ))
+    else
+        printf "%d B" "$b"
+    fi
+}
+
+_tgbot_bar() {
+    local used="$1" total="$2" width=12
+    local pct=0; (( total > 0 )) && pct=$(( used * 100 / total ))
+    (( pct > 100 )) && pct=100
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty;  i++)); do bar+="░"; done
+    printf "%s  %d%%" "$bar" "$pct"
+}
+
+_tgbot_next_reset() {
+    local reset_day="$1" last_reset="$2"
+    local cy cm cd
+    cy=$(date +%Y); cm=$(date +%-m); cd=$(date +%-d)
+    local cur_ym; cur_ym=$(date +%Y-%m)
+
+    if [[ "$last_reset" == "$cur_ym" ]]; then
+        # Already reset this month → next is next month
+        local nm=$(( cm + 1 )) ny=$cy
+        (( nm > 12 )) && { nm=1; (( ny++ )); }
+        printf "%d-%02d-%02d" "$ny" "$nm" "$reset_day"
+    elif (( cd < reset_day )); then
+        # Reset day not yet reached this month
+        printf "%d-%02d-%02d" "$cy" "$cm" "$reset_day"
+    else
+        # Reset day passed but timer may not have fired yet → show as today/imminent
+        t tgbot.next_reset.today "$cy" "$cm" "$reset_day"
+    fi
+}
+
+# ── Traffic query ──────────────────────────────────────────────────────────────
+_tgbot_query_port() {
+    local port="$1"
+    local state="${CFG_DIR}/traffic/state.json"
+
+    [[ -f "$state" ]] || { echo "$(t tgbot.query.no_data_enabled)"; return; }
+
+    # Find tag by port
+    local tag
+    tag=$(jq -r --argjson p "$port" \
+        'to_entries[] | select((.value.port | tostring) == ($p | tostring)) | .key' \
+        "$state" 2>/dev/null | head -1)
+
+    if [[ -z "$tag" || "$tag" == "null" ]]; then
+        t tgbot.query.port_not_monitored "$port"
+        return
+    fi
+
+    local accumulated limit reset_day last_reset paused last_check
+    accumulated=$(jq -r --arg t "$tag" '.[$t].accumulated_bytes // 0' "$state")
+    limit=$(jq -r --arg t "$tag" '.[$t].limit_bytes // 0' "$state")
+    reset_day=$(jq -r --arg t "$tag" '.[$t].reset_day // 1' "$state")
+    last_reset=$(jq -r --arg t "$tag" '.[$t].last_reset // ""' "$state")
+    paused=$(jq -r --arg t "$tag" '.[$t].paused // false' "$state")
+    last_check=$(jq -r --arg t "$tag" '.[$t].last_check // ""' "$state")
+    [[ -z "$last_check" ]] && last_check="$(t tgbot.query.unknown)"
+
+    local remaining=$(( limit - accumulated ))
+    (( remaining < 0 )) && remaining=0
+    local pct=0; (( limit > 0 )) && pct=$(( accumulated * 100 / limit ))
+
+    local status_icon status_text
+    if [[ "$paused" == "true" ]]; then
+        status_icon="🔴"  status_text="$(t tgbot.query.status_paused)"
+    elif (( pct >= 90 )); then
+        status_icon="🟡"  status_text="$(t tgbot.query.status_warn)"
+    else
+        status_icon="🟢"  status_text="$(t tgbot.query.status_running)"
+    fi
+
+    local next_reset; next_reset=$(_tgbot_next_reset "$reset_day" "$last_reset")
+    local time_str; time_str=$(echo "$last_check" | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+    [[ -z "$time_str" ]] && time_str="$last_check"
+
+    printf '📡 *%s*\n' "$tag"
+    printf '━━━━━━━━━━━━━━━━━━━━\n'
+    printf "$(t tgbot.query.port_line)" "$status_icon" "$status_text" "$port"
+    printf '`%s`\n\n' "$(_tgbot_bar "$accumulated" "$limit")"
+    printf "$(t tgbot.query.used)" "$(_tgbot_fmt_bytes "$accumulated")"
+    printf "$(t tgbot.query.limit)" "$(_tgbot_fmt_bytes "$limit")"
+    printf "$(t tgbot.query.remaining)" "$(_tgbot_fmt_bytes "$remaining")"
+    printf '━━━━━━━━━━━━━━━━━━━━\n'
+    printf "$(t tgbot.query.reset_line)" "$reset_day" "$next_reset"
+    printf "$(t tgbot.query.updated_at)" "$time_str"
+}
+
+_tgbot_list_nodes() {
+    local state="${CFG_DIR}/traffic/state.json"
+    # which server this is: with several servers' bots in one group, each answers
+    # (in a code span: a _ in a hostname is no Markdown there)
+    local server=""; [[ -n "$TG_SERVER_LABEL" ]] && server="🖥 \`${TG_SERVER_LABEL}\`"$'\n'
+    [[ -f "$state" ]] || { echo "${server}$(t tgbot.list.no_data)"; return; }
+
+    local count; count=$(jq 'length' "$state" 2>/dev/null || echo 0)
+    (( count == 0 )) && { echo "${server}$(t tgbot.list.empty)"; return; }
+
+    printf "$(t tgbot.list.title)"
+    printf '%s' "$server"
+    printf '━━━━━━━━━━━━━━━━━━━━\n'
+
+    while IFS= read -r tag; do
+        local port accumulated limit paused pct
+        port=$(jq -r --arg t "$tag" '.[$t].port' "$state")
+        accumulated=$(jq -r --arg t "$tag" '.[$t].accumulated_bytes // 0' "$state")
+        limit=$(jq -r --arg t "$tag" '.[$t].limit_bytes // 0' "$state")
+        paused=$(jq -r --arg t "$tag" '.[$t].paused // false' "$state")
+        pct=0; (( limit > 0 )) && pct=$(( accumulated * 100 / limit ))
+
+        local icon="🟢"
+        [[ "$paused" == "true" ]] && icon="🔴"
+        (( pct >= 90 )) && [[ "$paused" != "true" ]] && icon="🟡"
+
+        local extra=""
+        [[ "$paused" == "true" ]] && extra="$(t tgbot.list.paused_extra)"
+
+        printf '\n%s *%s*  `%s`%s\n' "$icon" "$tag" "$port" "$extra"
+        printf '`%s`\n' "$(_tgbot_bar "$accumulated" "$limit")"
+        printf '%s / %s\n' \
+            "$(_tgbot_fmt_bytes "$accumulated")" \
+            "$(_tgbot_fmt_bytes "$limit")"
+    done < <(jq -r 'keys[]' "$state" 2>/dev/null)
+
+    printf '\n━━━━━━━━━━━━━━━━━━━━\n'
+    printf "$(t tgbot.list.detail_hint)"
+}
+
+# ── Permission helpers ─────────────────────────────────────────────────────────
+_tgbot_is_admin() {
+    local user_id="$1"
+    [[ -z "${TG_ADMIN_IDS:-}" ]] && return 0   # no admin list → everyone is admin
+    echo ",${TG_ADMIN_IDS}," | grep -q ",${user_id},"
+}
+
+_tgbot_tenant_port() {
+    local user_id="$1"
+    [[ -f "$TG_USERS_FILE" ]] || return 1
+    jq -r --arg u "$user_id" '.[$u].port // empty' "$TG_USERS_FILE" 2>/dev/null
+}
+
+_tgbot_is_tenant() {
+    local user_id="$1"
+    [[ -f "$TG_USERS_FILE" ]] || return 1
+    jq -e --arg u "$user_id" 'has($u)' "$TG_USERS_FILE" &>/dev/null
+}
+
+# ── Admin-only commands ────────────────────────────────────────────────────────
+_tgbot_cmd_token() {
+    local chat_id="$1" args="$2"
+    local port reset_flag
+    port=$(echo "$args" | awk '{print $1}')
+    reset_flag=$(echo "$args" | awk '{print $2}')
+
+    if [[ -z "$port" ]]; then
+        _tgbot_send "$chat_id" "$(t tgbot.token.usage)"
+        return
+    fi
+
+    local existing; existing=$(_tgbot_port_token "$port") || true
+
+    if [[ -z "$existing" || "$reset_flag" == "reset" ]]; then
+        local new_token; new_token=$(_tgbot_gen_token)
+        if ! _tgbot_set_token "$port" "$new_token"; then
+            _tgbot_send "$chat_id" "$(t tgbot.token.gen_failed)"
+            return
+        fi
+        local action; [[ "$reset_flag" == "reset" ]] && action="$(t tgbot.token.action_reset)" || action="$(t tgbot.token.action_created)"
+        _tgbot_send "$chat_id" "$(t tgbot.token.generated "$action" "$port" "$new_token" "$port" "$new_token")"
+    else
+        # Show existing token + bound uid if any
+        local unbound_label; unbound_label="$(t tgbot.token.unbound)"
+        local bound_uid; bound_uid=$(jq -r --arg p "$port" \
+            --arg unbound "$unbound_label" \
+            'if (.[$p] | type) == "object" then (.[$p].uid // $unbound) else $unbound end' \
+            "$BIND_TOKENS_FILE" 2>/dev/null) || true
+        local bound_at; bound_at=$(jq -r --arg p "$port" \
+            'if (.[$p] | type) == "object" then (.[$p].bound_at // "") else "" end' \
+            "$BIND_TOKENS_FILE" 2>/dev/null) || true
+        local uid_line=""
+        if [[ "$bound_uid" != "$unbound_label" && "$bound_uid" != "null" && -n "$bound_uid" ]]; then
+            if [[ -n "$bound_at" ]]; then
+                uid_line="$(t tgbot.token.tenant_id_line_bound "$bound_uid" "$bound_at")"
+            else
+                uid_line="$(t tgbot.token.tenant_id_line "$bound_uid")"
+            fi
+        fi
+        _tgbot_send "$chat_id" "$(t tgbot.token.existing "$port" "$existing" "$uid_line" "$port" "$existing" "$port")"
+    fi
+}
+
+_tgbot_cmd_bind() {
+    local chat_id="$1" args="$2"
+    local uid port
+    uid=$(echo "$args" | awk '{print $1}')
+    port=$(echo "$args" | awk '{print $2}')
+    if [[ -z "$uid" || -z "$port" ]]; then
+        _tgbot_send "$chat_id" "$(t tgbot.bind.usage)"
+        return
+    fi
+    # Resolve tag from traffic state
+    local tag=""
+    local state="${CFG_DIR}/traffic/state.json"
+    [[ -f "$state" ]] && tag=$(jq -r --argjson p "$port" \
+        'to_entries[] | select((.value.port | tostring) == ($p | tostring)) | .key' \
+        "$state" 2>/dev/null | head -1)
+
+    [[ -f "$TG_USERS_FILE" ]] || echo '{}' > "$TG_USERS_FILE"
+    local tmp; tmp=$(mktemp)
+    jq --arg u "$uid" --arg p "$port" --arg t "${tag:-}" \
+        '.[$u] = {"port": $p, "tag": $t}' \
+        "$TG_USERS_FILE" > "$tmp" && mv "$tmp" "$TG_USERS_FILE"
+    _tgbot_send "$chat_id" "$(t tgbot.bind.success "$uid" "$port" "${tag:+  (${tag})}")"
+}
+
+_tgbot_cmd_unbind() {
+    local chat_id="$1" uid="$2"
+    if [[ -z "$uid" ]]; then
+        _tgbot_send "$chat_id" "$(t tgbot.unbind.usage)"
+        return
+    fi
+    if ! _tgbot_is_tenant "$uid"; then
+        _tgbot_send "$chat_id" "$(t tgbot.unbind.not_bound "$uid")"
+        return
+    fi
+    local tmp; tmp=$(mktemp)
+    jq --arg u "$uid" 'del(.[$u])' "$TG_USERS_FILE" > "$tmp" && mv "$tmp" "$TG_USERS_FILE"
+    _tgbot_send "$chat_id" "$(t tgbot.unbind.success "$uid")"
+}
+
+_tgbot_cmd_users() {
+    local chat_id="$1"
+    if [[ ! -f "$TG_USERS_FILE" ]] || \
+       [[ "$(jq 'length' "$TG_USERS_FILE" 2>/dev/null || echo 0)" == "0" ]]; then
+        _tgbot_send "$chat_id" "$(t tgbot.users.empty)"
+        return
+    fi
+    local msg
+    msg="$(t tgbot.users.title)"$'\n''━━━━━━━━━━━━━━━━━━━━'$'\n'
+    while IFS=$'\t' read -r uid port tag; do
+        msg+=$'\n'"🔑 \`${uid}\`"$'\n'
+        msg+="$(t tgbot.users.port_line "$port")"
+        [[ -n "$tag" && "$tag" != "null" && "$tag" != "" ]] && msg+="  (${tag})"
+        msg+=$'\n'
+    done < <(jq -r 'to_entries[] | [.key, .value.port, (.value.tag // "")] | @tsv' \
+                "$TG_USERS_FILE" 2>/dev/null)
+    msg+=$'\n''━━━━━━━━━━━━━━━━━━━━'$'\n'
+    msg+="$(t tgbot.users.manage_hint)"
+    _tgbot_send "$chat_id" "$msg"
+}
+
+# ── Expiry admin commands ──────────────────────────────────────────────────────
+
+# /expiry — list all node expiry statuses
+_tgbot_cmd_expiry() {
+    local chat_id="$1"
+    if ! declare -f _exp_get_tags &>/dev/null; then
+        _tgbot_send "$chat_id" "$(t tgbot.expiry.module_missing)"; return; fi
+    _exp_init
+    local msg; msg="$(t tgbot.expiry.status_title)"
+    local count=0
+    while IFS= read -r tag; do
+        count=$(( count + 1 ))
+        local port exp_at exp_ts now_ts diff
+        port=$(_exp_get "$tag" "port")
+        exp_at=$(_exp_get "$tag" "expires_at")
+        exp_ts=$(_exp_str_to_ts "$exp_at")
+        now_ts=$(_exp_now_ts)
+        diff=$(( exp_ts - now_ts ))
+        local icon
+        if   (( diff < 0 ));        then icon="🔴"
+        elif (( diff < 86400 ));    then icon="🔴"
+        elif (( diff < 3*86400 ));  then icon="🟡"
+        elif (( diff < 7*86400 ));  then icon="🟡"
+        else                             icon="🟢"; fi
+        local days_str
+        if (( diff >= 0 )); then days_str="$(t tgbot.expiry.days_left "$(( diff/86400 ))")"
+        else                     days_str="$(t tgbot.expiry.days_expired "$(( -diff/86400 ))")"; fi
+        msg+="$(t tgbot.expiry.status_line "$icon" "$tag" "$port" "$exp_at" "$days_str")"
+    done < <(_exp_get_tags)
+    if (( count == 0 )); then
+        msg+="$(t tgbot.expiry.none_set)"; fi
+    _tgbot_send "$chat_id" "$msg"
+}
+
+# /renew <port> <months> — renew a node by N months
+_tgbot_cmd_renew() {
+    local chat_id="$1" arg="$2"
+    if ! declare -f exp_renew &>/dev/null; then
+        _tgbot_send "$chat_id" "$(t tgbot.expiry.module_missing)"; return; fi
+    local port months
+    port=$(echo "$arg" | awk '{print $1}')
+    months=$(echo "$arg" | awk '{print $2}')
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || ! [[ "$months" =~ ^[0-9]+$ ]] || (( months < 1 )); then
+        _tgbot_send "$chat_id" "$(t tgbot.renew.usage)"
+        return
+    fi
+    local tag; tag=$(exp_tag_for_port "$port")
+    if [[ -z "$tag" ]]; then
+        _tgbot_send "$chat_id" "$(t tgbot.renew.port_missing "$port")"
+        return
+    fi
+    # Snapshot paused state BEFORE exp_renew clears it
+    local was_paused; was_paused=$(_exp_get "$tag" "expired_paused")
+    local new_exp; new_exp=$(exp_renew "$tag" "$months")
+    # Resume the node if it was paused by expiry
+    if [[ "$was_paused" == "true" ]]; then
+        # traffic.sh may not be sourced in the bot daemon — load it on demand
+        declare -f _trf_resume_tag &>/dev/null || \
+            source "${PSM_ROOT}/lib/traffic.sh" 2>/dev/null || true
+        declare -f _trf_resume_tag &>/dev/null && _trf_resume_tag "$tag" 2>/dev/null || true
+    fi
+    _tgbot_send "$chat_id" "$(t tgbot.renew.success "$tag" "$port" "$months" "$new_exp")"
+    # Notify tenant
+    tg_notify_expiry_renewed "$port" "$new_exp" 2>/dev/null || true
+}
+
+# ── Message dispatch ───────────────────────────────────────────────────────────
+
+_tgbot_handle() {
+    local chat_id="$1" user_id="$2" text="$3"
+    local cmd arg
+    cmd=$(echo "$text" | awk '{print $1}')
+    arg=$(echo "$text" | awk 'NF>1{$1=""; sub(/^ /,""); print}')
+
+    # ── Admin path ────────────────────────────────────────────────────────────
+    if _tgbot_is_admin "$user_id"; then
+        case "$cmd" in
+            /start|/help)
+                _tgbot_send_kb "$chat_id" \
+                    "$(t tgbot.help.admin_start)" \
+                    "$(_tgbot_kb_admin)"
+                ;;
+            /list|/all|/nodes)
+                _tgbot_send "$chat_id" "$(_tgbot_list_nodes)"
+                ;;
+            /relay|/zhongzhuan)
+                _tgbot_cmd_relay "$chat_id"
+                ;;
+            /traffic)
+                if [[ "$arg" =~ ^[0-9]+$ ]]; then
+                    _tgbot_send "$chat_id" "$(_tgbot_query_port "$arg")"
+                else
+                    _tgbot_send "$chat_id" "$(t tgbot.traffic.usage)"
+                fi
+                ;;
+            /token)  _tgbot_cmd_token  "$chat_id" "$arg"  ;;
+            /bind)   _tgbot_cmd_bind   "$chat_id" "$arg"  ;;
+            /unbind) _tgbot_cmd_unbind "$chat_id" "$arg"  ;;
+            /users)  _tgbot_cmd_users  "$chat_id"         ;;
+            /expiry) _tgbot_cmd_expiry "$chat_id"         ;;
+            /renew)  _tgbot_cmd_renew  "$chat_id" "$arg"  ;;
+            /id)
+                _tgbot_send "$chat_id" "$(t tgbot.id_card "$user_id")"
+                ;;
+            *)
+                if [[ "$text" =~ ^[0-9]+$ ]] && (( text >= 1 && text <= 65535 )); then
+                    _tgbot_send "$chat_id" "$(_tgbot_query_port "$text")"
+                fi
+                ;;
+        esac
+        return
+    fi
+
+    # ── Tenant path ───────────────────────────────────────────────────────────
+    local tenant_port; tenant_port=$(_tgbot_tenant_port "$user_id")
+    if [[ -n "$tenant_port" ]]; then
+        case "$cmd" in
+            /start|/help)
+                _tgbot_send_kb "$chat_id" \
+                    "$(t tgbot.help.tenant_start "$tenant_port")" \
+                    "$(_tgbot_kb_tenant)"
+                ;;
+            /traffic)
+                _tgbot_send_kb "$chat_id" \
+                    "$(_tgbot_query_port "$tenant_port")" \
+                    "$(_tgbot_kb_tenant)"
+                ;;
+            /id)
+                _tgbot_send "$chat_id" "$(t tgbot.id_card "$user_id")"
+                ;;
+            /list|/all|/nodes|/bind|/unbind|/users)
+                _tgbot_send "$chat_id" "$(t tgbot.permission_denied)"
+                ;;
+            *)
+                _tgbot_send_kb "$chat_id" \
+                    "$(_tgbot_query_port "$tenant_port")" \
+                    "$(_tgbot_kb_tenant)"
+                ;;
+        esac
+        return
+    fi
+
+    # ── Self-registration: <port> <token> ────────────────────────────────────
+    local state="${CFG_DIR}/traffic/state.json"
+    if [[ -f "$state" ]]; then
+        local input_port input_token
+        input_port=$(echo "$text" | awk '{print $1}')
+        input_token=$(echo "$text" | awk '{print $2}')
+
+        # Resolve port → tag (support both port number and tag name as first word)
+        local matched_port="" matched_tag=""
+        if [[ "$input_port" =~ ^[0-9]+$ ]]; then
+            matched_tag=$(jq -r --argjson p "$input_port" \
+                'to_entries[] | select((.value.port | tostring) == ($p | tostring)) | .key' \
+                "$state" 2>/dev/null | head -1)
+            [[ -n "$matched_tag" && "$matched_tag" != "null" ]] && matched_port="$input_port"
+        else
+            matched_port=$(jq -r --arg t "$input_port" \
+                'to_entries[] | select(.key == $t) | .value.port' \
+                "$state" 2>/dev/null | head -1)
+            [[ -n "$matched_port" && "$matched_port" != "null" ]] && matched_tag="$input_port"
+        fi
+
+        if [[ -n "$matched_port" ]]; then
+            local expected; expected=$(_tgbot_port_token "$matched_port")
+
+            if [[ -n "$expected" ]]; then
+                # Token required for this port
+                if [[ -z "$input_token" ]]; then
+                    _tgbot_send "$chat_id" "$(t tgbot.bind_token.required "$matched_port" "$matched_port")"
+                    return
+                fi
+                if [[ "$input_token" != "$expected" ]]; then
+                    _tgbot_send "$chat_id" "$(t tgbot.bind_token.wrong)"
+                    return
+                fi
+            fi
+
+            # Token valid (or no token required) → bind
+            [[ -f "$TG_USERS_FILE" ]] || echo '{}' > "$TG_USERS_FILE"
+            local tmp; tmp=$(mktemp)
+            jq --arg u "$user_id" --arg p "$matched_port" --arg t "${matched_tag:-}" \
+                '.[$u] = {"port": $p, "tag": $t}' \
+                "$TG_USERS_FILE" > "$tmp" && mv "$tmp" "$TG_USERS_FILE"
+
+            # Record uid into bind_tokens.json so admin can see who is bound to each port
+            _tgbot_record_token_uid "$matched_port" "$user_id" || true
+
+            # Notify all admins
+            local notify_msg
+            notify_msg="$(t tgbot.notify.new_tenant "$user_id" "$matched_port" "${matched_tag:+  (${matched_tag})}" "$user_id")"
+            local aid
+            IFS=',' read -ra _aids <<< "${TG_ADMIN_IDS:-}"
+            for aid in "${_aids[@]}"; do
+                aid="${aid// /}"
+                [[ -n "$aid" ]] && _tgbot_send "$aid" "$notify_msg"
+            done
+
+            local traffic_card; traffic_card=$(_tgbot_query_port "$matched_port")
+            _tgbot_send_kb "$chat_id" \
+                "$(t tgbot.tenant.bind_success "$matched_port" "$traffic_card")" \
+                "$(_tgbot_kb_tenant)"
+            return
+        fi
+    fi
+
+    # ── No access ─────────────────────────────────────────────────────────────
+    _tgbot_send "$chat_id" "$(t tgbot.access_restricted "$user_id")"
+}
+
+# ── Daemon (long-polling loop) ─────────────────────────────────────────────────
+tgbot_daemon() {
+    _tgbot_load_cfg || exit 1
+
+    # Source traffic helpers for live checkpoint
+    source "$LIB_DIR/traffic.sh" 2>/dev/null || true
+    _trf_init 2>/dev/null || true
+
+    local offset=0
+    [[ -f "$TG_BOT_OFFSET" ]] && offset=$(cat "$TG_BOT_OFFSET" 2>/dev/null || echo 0)
+
+    TG_BOT_USERNAME=$(_tgbot_api getMe | jq -r '.result.username // empty' 2>/dev/null) || TG_BOT_USERNAME=""
+    TG_SERVER_LABEL="$(hostname)"
+    local ip; ip=$(get_ipv4 2>/dev/null) || ip=""
+    [[ "$ip" =~ ^[0-9.]+$ ]] && TG_SERVER_LABEL="$TG_SERVER_LABEL · $ip"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') PSM Telegram Bot started (offset=${offset}, @${TG_BOT_USERNAME:-?}, ${TG_SERVER_LABEL})"
+
+    while true; do
+        local resp
+        # not curl -f: Telegram's refusal is in the body (409 = polled elsewhere too)
+        resp=$(curl -sS --max-time 35 "${TG_API_BASE}${TG_BOT_TOKEN}/getUpdates" \
+            -d "offset=${offset}" \
+            -d "timeout=30" \
+            -d 'allowed_updates=["message","callback_query"]' 2>/dev/null) || { sleep 5; continue; }
+
+        local ok; ok=$(echo "$resp" | jq -r '.ok' 2>/dev/null)
+        if [[ "$ok" != "true" ]]; then
+            [[ "$(echo "$resp" | jq -r '.error_code // empty' 2>/dev/null)" == 409 ]] && _tgbot_conflict
+            sleep 5; continue
+        fi
+
+        local n; n=$(echo "$resp" | jq '.result | length' 2>/dev/null || echo 0)
+
+        for (( i=0; i<n; i++ )); do
+            local upd; upd=$(echo "$resp" | jq ".result[$i]")
+            local upd_id; upd_id=$(echo "$upd" | jq -r '.update_id')
+
+            # Advance offset BEFORE processing — prevents infinite crash loop
+            # if a message handler exits non-zero under set -e
+            offset=$(( upd_id + 1 ))
+            echo "$offset" > "$TG_BOT_OFFSET"
+
+            # callback_query (inline button press)
+            local cb_id; cb_id=$(echo "$upd" | jq -r '.callback_query.id // empty')
+            if [[ -n "$cb_id" ]]; then
+                local cb_chat cb_user cb_data
+                cb_chat=$(echo "$upd" | jq -r '.callback_query.message.chat.id // empty')
+                cb_user=$(echo "$upd" | jq -r '.callback_query.from.id // empty')
+                cb_data=$(echo "$upd" | jq -r '.callback_query.data // empty')
+                [[ -n "$cb_chat" && -n "$cb_user" && -n "$cb_data" ]] && \
+                    _tgbot_handle_callback "$cb_id" "$cb_chat" "$cb_user" "$cb_data" || true
+            else
+                # Regular text message
+                local chat_id user_id text chat_type
+                chat_id=$(echo "$upd" | jq -r '.message.chat.id // empty')
+                user_id=$(echo "$upd" | jq -r '.message.from.id // empty')
+                text=$(echo "$upd" | jq -r '.message.text // empty')
+                chat_type=$(echo "$upd" | jq -r '.message.chat.type // "private"')
+                text=$(_tgbot_own_text "$chat_type" "$text") || text=""
+                [[ -n "$chat_id" && -n "$text" ]] && \
+                    _tgbot_handle "$chat_id" "$user_id" "$text" || true
+            fi
+        done
+
+        # Refresh traffic data so queries always return up-to-date numbers
+        _trf_ipt_restore_all 2>/dev/null || true
+        _trf_checkpoint_all  2>/dev/null || true
+    done
+}
+
+# ── Systemd service management ─────────────────────────────────────────────────
+_tgbot_install_svc() {
+    if ! _uses_systemd; then
+        psm_write_openrc_service psm-tgbot "PSM Telegram Traffic Bot" "${PSM_ROOT}/manager.sh" "--tgbot" || return 1
+        svc_enable psm-tgbot || true
+        svc_restart psm-tgbot
+        log_ok "$(t tgbot.service.started)"
+        return 0
+    fi
+    cat > "$TG_BOT_SVC" <<EOF
+[Unit]
+Description=PSM Telegram Traffic Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${PSM_ROOT}/manager.sh --tgbot
+Restart=always
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now psm-tgbot.service
+    log_ok "$(t tgbot.service.started)"
+}
+
+_tgbot_uninstall_svc() {
+    systemctl disable --now psm-tgbot.service 2>/dev/null || true
+    rm -f "$TG_BOT_SVC"
+    psm_remove_openrc_service psm-tgbot
+    svc_daemon_reload
+    log_ok "$(t tgbot.service.deleted)"
+}
+
+_tgbot_svc_active() {
+    svc_is_active psm-tgbot 2>/dev/null
+}
+
+# ── Setup wizard ───────────────────────────────────────────────────────────────
+tgbot_setup() {
+    echo -e "\n${BOLD}${BLUE}$(t tgbot.setup.title)${NC}"
+    echo -e "$(t tgbot.setup.step1 "${CYAN}@BotFather${NC}")"
+    echo -e "$(t tgbot.setup.step2)"
+    echo -e "$(t tgbot.setup.step3)"
+    echo -e "  ${YELLOW}$(t tgbot.setup.one_per_server)${NC}"
+    echo ""
+
+    local cur_token=""
+    [[ -f "$TG_BOT_CFG" ]] && { source "$TG_BOT_CFG" 2>/dev/null; cur_token="${TG_BOT_TOKEN:-}"; }
+
+    local token
+    if [[ -n "$cur_token" ]]; then
+        ask token "$(t tgbot.setup.token_keep)" "$cur_token"
+    else
+        ask token "Bot Token"
+    fi
+    [[ -z "$token" ]] && { log_error "$(t tgbot.setup.token_empty)"; return 1; }
+
+    # Validate token
+    log_step "$(t tgbot.setup.validating)"
+    local bot_info
+    bot_info=$(curl -fsSL --max-time 10 \
+        "${TG_API_BASE}${token}/getMe" 2>/dev/null)
+    local bot_ok; bot_ok=$(echo "$bot_info" | jq -r '.ok' 2>/dev/null)
+    if [[ "$bot_ok" != "true" ]]; then
+        log_error "$(t tgbot.setup.invalid)"
+        return 1
+    fi
+    local bot_name; bot_name=$(echo "$bot_info" | jq -r '.result.username')
+    log_ok "$(t tgbot.setup.verified "$bot_name")"
+
+    # Admin whitelist
+    echo ""
+    echo -e "  ${YELLOW}$(t tgbot.setup.admin_title)${NC}"
+    echo -e "  $(t tgbot.setup.admin_any)"
+    echo -e "  $(t tgbot.setup.admin_only)"
+    echo -e "  $(t tgbot.setup.admin_id_hint)"
+    echo ""
+
+    local cur_ids="${TG_ADMIN_IDS:-${TG_ALLOWED_IDS:-}}"
+    local admin_ids
+    ask admin_ids "$(t tgbot.setup.ask_admin_ids)" "$cur_ids"
+
+    TG_BOT_TOKEN="$token"
+    TG_ADMIN_IDS="$admin_ids"
+    _tgbot_save_cfg
+
+    log_ok "$(t tgbot.setup.saved "$TG_BOT_CFG")"
+    echo ""
+
+    if _tgbot_svc_active; then
+        ask_yn "$(t tgbot.setup.ask_restart)" Y && \
+            svc_restart psm-tgbot && log_ok "$(t tgbot.service.restarted)"
+    else
+        ask_yn "$(t tgbot.setup.ask_start)" Y && _tgbot_install_svc
+    fi
+}
+
+# ── Tenant management (PSM menu) ──────────────────────────────────────────────
+tgbot_tenant_menu() {
+    local state="${CFG_DIR}/traffic/state.json"
+    while true; do
+        echo -e "\n${BOLD}${BLUE}$(t tgbot.tenant_menu.title)${NC}"
+
+        # Show current bindings
+        if [[ -f "$TG_USERS_FILE" ]] && \
+           [[ "$(jq 'length' "$TG_USERS_FILE" 2>/dev/null || echo 0)" -gt 0 ]]; then
+            echo -e "${BOLD}$(t tgbot.tenant_menu.current)${NC}"
+            while IFS=$'\t' read -r uid port tag; do
+                printf "$(t tgbot.tenant_menu.current_line)" \
+                    "$uid" "$port" "${tag:+(${tag})}"
+            done < <(jq -r 'to_entries[] | [.key, .value.port, (.value.tag // "")] | @tsv' \
+                        "$TG_USERS_FILE" 2>/dev/null)
+        else
+            echo -e "  ${YELLOW}$(t tgbot.tenant_menu.empty)${NC}"
+        fi
+        echo ""
+
+        show_menu "$(t tgbot.tenant_menu.menu_title)" \
+            "$(t tgbot.tenant_menu.bind)" \
+            "$(t tgbot.tenant_menu.unbind)" \
+            "$(t tgbot.tenant_menu.list)"
+
+        case "$MENU_CHOICE" in
+            1)
+                local uid port
+                ask uid  "$(t tgbot.tenant_menu.ask_uid)"
+                ask port "$(t tgbot.tenant_menu.ask_port)"
+                if [[ -z "$uid" || -z "$port" ]]; then
+                    log_error "$(t tgbot.tenant_menu.uid_port_required)"; continue
+                fi
+                local tag=""
+                [[ -f "$state" ]] && tag=$(jq -r --argjson p "$port" \
+                    'to_entries[] | select((.value.port | tostring) == ($p | tostring)) | .key' \
+                    "$state" 2>/dev/null | head -1)
+                [[ -f "$TG_USERS_FILE" ]] || echo '{}' > "$TG_USERS_FILE"
+                local tmp; tmp=$(mktemp)
+                jq --arg u "$uid" --arg p "$port" --arg t "${tag:-}" \
+                    '.[$u] = {"port": $p, "tag": $t}' \
+                    "$TG_USERS_FILE" > "$tmp" && mv "$tmp" "$TG_USERS_FILE"
+                log_ok "$(t tgbot.tenant_menu.bound "$uid" "$port" "${tag:+ (${tag})}")"
+                press_enter
+                ;;
+            2)
+                local uid
+                ask uid "$(t tgbot.tenant_menu.ask_unbind_uid)"
+                if [[ -z "$uid" ]]; then continue; fi
+                if ! jq -e --arg u "$uid" 'has($u)' "$TG_USERS_FILE" &>/dev/null 2>&1; then
+                    log_warn "$(t tgbot.tenant_menu.not_bound "$uid")"; press_enter; continue
+                fi
+                local tmp; tmp=$(mktemp)
+                jq --arg u "$uid" 'del(.[$u])' "$TG_USERS_FILE" > "$tmp" && \
+                    mv "$tmp" "$TG_USERS_FILE"
+                log_ok "$(t tgbot.tenant_menu.unbound "$uid")"
+                press_enter
+                ;;
+            3)
+                if [[ ! -f "$TG_USERS_FILE" ]] || \
+                   [[ "$(jq 'length' "$TG_USERS_FILE" 2>/dev/null || echo 0)" == "0" ]]; then
+                    log_warn "$(t tgbot.tenant_menu.empty)"
+                else
+                    echo -e "\n${BOLD}$(t tgbot.tenant_menu.details)${NC}"
+                    while IFS=$'\t' read -r uid port tag; do
+                        printf "$(t tgbot.tenant_menu.detail_line)" "$uid" "$port" "${tag:+(${tag})}"
+                    done < <(jq -r 'to_entries[] | [.key, .value.port, (.value.tag // "")] | @tsv' \
+                                "$TG_USERS_FILE" 2>/dev/null)
+                fi
+                press_enter
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ── Menu ───────────────────────────────────────────────────────────────────────
+tgbot_menu() {
+    while true; do
+        local svc_status
+        if _tgbot_svc_active; then
+            svc_status="${GREEN}$(t tgbot.menu.running)${NC}"
+        else
+            svc_status="${RED}$(t tgbot.menu.not_running)${NC}"
+        fi
+
+        echo -e "\n${BOLD}${BLUE}$(t tgbot.menu.header)${NC}  ($(t tgbot.menu.service_status "$(echo -e "$svc_status")")${BOLD}${BLUE})${NC}"
+        _tgbot_conflict_recent && echo -e "  ${YELLOW}$(t tgbot.conflict.menu)${NC}"
+        show_menu "Telegram Bot" \
+            "$(t tgbot.menu.config)" \
+            "$(t tgbot.menu.tenants)" \
+            "$(t tgbot.menu.start)" \
+            "$(t tgbot.menu.stop)" \
+            "$(t tgbot.menu.restart)" \
+            "$(t tgbot.menu.logs)" \
+            "$(t tgbot.menu.uninstall)" \
+            "$(t tgbot.menu.health_report)"
+
+        case "$MENU_CHOICE" in
+            1) tgbot_setup ;;
+            2) _tgbot_load_cfg && tgbot_tenant_menu; press_enter ;;
+            3) _tgbot_load_cfg && _tgbot_install_svc; press_enter ;;
+            4) svc_stop psm-tgbot &>/dev/null && log_ok "$(t tgbot.service.stopped)"; press_enter ;;
+            5) svc_restart psm-tgbot &>/dev/null && log_ok "$(t tgbot.service.restarted)"; press_enter ;;
+            6) svc_logs psm-tgbot ;;
+            7) ask_yn "$(t tgbot.menu.ask_uninstall)" N && _tgbot_uninstall_svc; press_enter ;;
+            8) source "$LIB_DIR/tgbot/health_report.sh"; hr_menu ;;
+            0) return ;;
+        esac
+    done
+}
