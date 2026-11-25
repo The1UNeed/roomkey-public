@@ -3,8 +3,12 @@
 # command that installs your first server. Run it from this repository:
 #
 #   ./setup.sh            guided: asks a few questions, then does everything
+#   ./setup.sh --yes      the same, answering "yes" to installing tools and updates
 #   ./setup.sh --dry-run  everything up to Cloudflare (tools, bundle, config), nothing sent
 #
+# What it installs when missing: git, curl, openssl, tar (the system's package
+# manager, with sudo when not root) and Node.js 22 (the official build, checked
+# against nodejs.org's SHA256SUMS, into ~/.roomkey/node: nothing system-wide).
 # Safe to run again (after pulling changes, say): it remembers your answers in
 # ~/.roomkey/ and only redeploys. The repository stays private: servers get
 # PSM and psm-agent from the panel itself, with a one-time install command.
@@ -16,7 +20,17 @@ ROOMKEY_GIT="${ROOMKEY_GIT:-https://github.com/The1UNeed/roomkey-public.git}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 if [[ ! -f "$ROOT/panel/package.json" || ! -d "$ROOT/stack" ]]; then
     dest="${ROOMKEY_DIR:-$HOME/roomkey}"
-    command -v git >/dev/null 2>&1 || { echo "roomkey: git is needed (macOS: xcode-select --install; Debian/Ubuntu: apt install git)" >&2; exit 1; }
+    if ! command -v git >/dev/null 2>&1; then
+        echo "roomkey: installing git ..."
+        sudo_=""; [[ $EUID -eq 0 ]] || sudo_=sudo
+        if command -v apt-get >/dev/null 2>&1; then $sudo_ apt-get update -qq && $sudo_ env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates
+        elif command -v dnf >/dev/null 2>&1; then $sudo_ dnf install -y -q git
+        elif command -v yum >/dev/null 2>&1; then $sudo_ yum install -y -q git
+        elif command -v apk >/dev/null 2>&1; then $sudo_ apk add --no-cache git
+        elif command -v brew >/dev/null 2>&1; then brew install git
+        else xcode-select --install 2>/dev/null; fi
+        command -v git >/dev/null 2>&1 || { echo "roomkey: git could not be installed; install it, then run this again" >&2; exit 1; }
+    fi
     if [[ -d "$dest/.git" ]]; then
         echo "roomkey: updating $dest ..."
         git -C "$dest" pull --ff-only -q || { echo "roomkey: could not update $dest (local changes?)" >&2; exit 1; }
@@ -32,13 +46,15 @@ STATE_DIR="${ROOMKEY_HOME:-$HOME/.roomkey}"
 ENV_FILE="$STATE_DIR/setup.env"
 KEY_FILE="$STATE_DIR/token-key"
 LOCAL_CFG="$PANEL/wrangler.local.jsonc"
-DRY=0
-case "${1:-}" in
-    --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    "") ;;
-    *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
-esac
+DRY=0; YES=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY=1 ;;
+        --yes|-y) YES=1 ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
+    esac
+done
 
 B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; C=$'\033[36m'; N=$'\033[0m'
 n=0
@@ -57,9 +73,78 @@ ask_secret() {   # <var> <question>
     read -r -s -p "  $2: " v; echo
     printf -v "$1" '%s' "$v"
 }
-yes_no() {   # <question> <default y|n>
+yes_no() {   # <question> <default y|n> (--yes answers yes)
+    (( YES )) && { printf '  %s [yes]\n' "$1"; return 0; }
     local v; read -r -p "  $1 [$( [[ $2 == y ]] && echo Y/n || echo y/N )]: " v
     v="${v:-$2}"; [[ "$v" =~ ^[Yy] ]]
+}
+
+# ── installing what is missing ────────────────────────────────────────────────
+SUDO=""
+if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
+can_root() { [[ $EUID -eq 0 || -n "$SUDO" ]]; }
+pkg_mgr() {
+    local m
+    for m in apt-get dnf yum apk pacman zypper brew; do command -v "$m" >/dev/null 2>&1 && { echo "$m"; return; }; done
+}
+pkg_refresh() {
+    case "$(pkg_mgr)" in
+        apt-get) $SUDO apt-get update -qq ;;
+        apk) $SUDO apk update -q ;;
+        pacman) $SUDO pacman -Sy --noconfirm >/dev/null ;;
+        brew) brew update -q >/dev/null || true ;;
+    esac
+}
+pkg_upgrade() {
+    case "$(pkg_mgr)" in
+        apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade ;;
+        dnf) $SUDO dnf -y -q upgrade ;;
+        yum) $SUDO yum -y -q update ;;
+        apk) $SUDO apk upgrade --no-cache -q ;;
+        pacman) $SUDO pacman -Su --noconfirm ;;
+        zypper) $SUDO zypper -q -n update ;;
+        brew) brew upgrade -q || true ;;
+    esac
+}
+pkg_install() {   # <packages…>
+    case "$(pkg_mgr)" in
+        apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+        dnf) $SUDO dnf install -y -q "$@" ;;
+        yum) $SUDO yum install -y -q "$@" ;;
+        apk) $SUDO apk add --no-cache -q "$@" ;;
+        pacman) $SUDO pacman -S --noconfirm --needed "$@" ;;
+        zypper) $SUDO zypper -q -n install "$@" ;;
+        brew) brew install "$@" ;;
+        *) return 1 ;;
+    esac
+}
+node_ok() {
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
+        && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' 2>/dev/null
+}
+# Node.js 22, the official build for this system, checked against nodejs.org's
+# SHA256SUMS, into ~/.roomkey/node (Alpine, musl: its own nodejs package).
+install_node() {
+    if [[ -f /etc/alpine-release ]]; then pkg_install nodejs npm; return; fi
+    local os arch base sums file tmp want got
+    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) return 1 ;; esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; armv7l) arch=armv7l ;;
+        *) warn "no official Node.js build for $(uname -m)"; return 1 ;;
+    esac
+    base="https://nodejs.org/dist/latest-v22.x"
+    sums=$(curl -fsSL --retry 3 "$base/SHASUMS256.txt") || return 1
+    file=$(awk -v s="-$os-$arch.tar.gz" 'substr($2, length($2) - length(s) + 1) == s { print $2; exit }' <<<"$sums")
+    [[ -n "$file" ]] || return 1
+    tmp=$(mktemp -d)
+    curl -fsSL --retry 3 -o "$tmp/$file" "$base/$file" || { rm -rf "$tmp"; return 1; }
+    want=$(awk -v f="$file" '$2 == f { print $1 }' <<<"$sums")
+    got=$( { command -v sha256sum >/dev/null 2>&1 && sha256sum "$tmp/$file" || shasum -a 256 "$tmp/$file"; } | awk '{ print $1 }')
+    [[ -n "$want" && "$want" == "$got" ]] || { rm -rf "$tmp"; warn "the Node.js download does not match its checksum"; return 1; }
+    rm -rf "$STATE_DIR/node"; mkdir -p "$STATE_DIR/node"
+    tar -xzf "$tmp/$file" -C "$STATE_DIR/node" --strip-components 1 || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    export PATH="$STATE_DIR/node/bin:$PATH"
 }
 save() {   # remember an answer (no secrets here)
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
@@ -69,27 +154,58 @@ save() {   # remember an answer (no secrets here)
 }
 wr() { ( cd "$PANEL" && npx --no-install wrangler "$@" ); }
 
+[[ -x "$STATE_DIR/node/bin/node" ]] && export PATH="$STATE_DIR/node/bin:$PATH"
 printf '%sroomkey setup%s — the panel on Cloudflare, then the command for your first server.\n' "$B" "$N"
 [[ $DRY == 1 ]] && warn "dry run: nothing is sent to Cloudflare"
 # shellcheck source=/dev/null
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+[[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] && export CLOUDFLARE_ACCOUNT_ID
 
 # ── 1. tools ──────────────────────────────────────────────────────────────────
 step "Checking the tools on this computer"
 missing=()
-for t in node npm git openssl curl; do
+for t in git curl openssl tar gzip; do
     if command -v "$t" >/dev/null 2>&1; then ok "$t"; else missing+=("$t"); fi
 done
+if node_ok; then ok "node $(node --version), npm $(npm --version)"
+elif command -v node >/dev/null 2>&1; then note "node $(node --version) is older than 20: Node.js 22 will be installed for roomkey"
+else note "node: not installed"; fi
 if command -v go >/dev/null 2>&1; then ok "go (psm-agent is built here)"
-else note "go: not installed — psm-agent comes from the published release instead"; fi
-if (( ${#missing[@]} )); then
-    note "Missing: ${missing[*]}"
-    command -v brew >/dev/null 2>&1 \
-        && note "Install them with:  brew install ${missing[*]/npm/node}" \
-        || note "Install them (macOS: https://brew.sh, then brew install ${missing[*]/npm/node}; Debian/Ubuntu: apt install nodejs npm git openssl curl)"
-    die "install the missing tools, then run ./setup.sh again"
+else note "go: not needed — psm-agent comes from the published release"; fi
+
+if (( ${#missing[@]} )) || ! node_ok; then
+    note ""
+    (( ${#missing[@]} )) && note "To install: ${missing[*]} (with $(pkg_mgr || echo 'no package manager')${SUDO:+, through sudo})"
+    node_ok || note "To install: Node.js 22 (official build, checksum-checked, into $STATE_DIR/node)"
+    yes_no "Install them now?" y || die "roomkey needs them: install them, then run ./setup.sh again"
+    if (( ${#missing[@]} )); then
+        can_root || die "installing ${missing[*]} needs root (or sudo): run this as root, or install them yourself"
+        [[ -n "$(pkg_mgr)" ]] || die "no package manager found: install ${missing[*]} yourself"
+        pkgs=("${missing[@]}")
+        [[ "$(pkg_mgr)" == apt-get ]] && pkgs+=(ca-certificates)
+        pkg_refresh || warn "the package list could not be refreshed"
+        pkg_install "${pkgs[@]}" || die "installing ${missing[*]} failed (above)"
+        for t in "${missing[@]}"; do command -v "$t" >/dev/null 2>&1 || die "$t is still missing"; done
+        ok "installed ${missing[*]}"
+    fi
+    if ! node_ok; then
+        note "Downloading Node.js 22 …"
+        install_node || die "Node.js could not be installed (install Node.js 20+ yourself: https://nodejs.org)"
+        node_ok || die "Node.js is still not usable"
+        ok "node $(node --version), npm $(npm --version) in $STATE_DIR/node"
+    fi
 fi
-node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' || die "Node.js 20 or newer is needed (node --version says $(node --version))"
+
+# system updates, when this is a machine you look after as root (a server)
+if [[ $DRY == 0 && "$(uname -s)" == Linux ]] && can_root && [[ -n "$(pkg_mgr)" && "${UPDATED_AT:-}" != "$(date +%Y-%m-%d)" ]]; then
+    if yes_no "Install this system's pending updates first ($(pkg_mgr) upgrade)?" y; then
+        note "Updating the system (this can take a few minutes) …"
+        { pkg_refresh && pkg_upgrade; } || warn "some updates did not install (above); setup goes on"
+        save UPDATED_AT "$(date +%Y-%m-%d)"
+        ok "system up to date"
+        [[ -f /var/run/reboot-required ]] && warn "the system asks for a reboot to finish its updates (after setup: reboot)"
+    fi
+fi
 if [[ -n "$(git -C "$ROOT" status --porcelain -- stack panel 2>/dev/null)" ]]; then
     warn "stack/ or panel/ has uncommitted changes: servers get PSM as of the last commit ($(git -C "$ROOT" log -1 --format='%h %cs'))"
 fi
@@ -115,6 +231,16 @@ elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not auth
         export CLOUDFLARE_API_TOKEN
         wr whoami >/dev/null 2>&1 || die "Cloudflare did not accept that token"
         ok "token accepted (it is not saved)"
+        # a token for more than one account: which one gets the panel
+        accounts=$(wr whoami --json 2>/dev/null | node -e '
+            let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+              try { for (const a of JSON.parse(s).accounts ?? []) console.log(`${a.id} ${a.name}`) } catch {} })')
+        if (( $(grep -c . <<<"$accounts") > 1 )); then
+            note "This token reaches several Cloudflare accounts:"
+            while read -r id name; do note "  $id  $name"; done <<<"$accounts"
+            ask CLOUDFLARE_ACCOUNT_ID "Account ID for the panel" "${CLOUDFLARE_ACCOUNT_ID:-$(head -1 <<<"$accounts" | cut -d' ' -f1)}"
+            export CLOUDFLARE_ACCOUNT_ID; save CLOUDFLARE_ACCOUNT_ID "$CLOUDFLARE_ACCOUNT_ID"
+        fi
     else
         note "A browser window opens: sign in to Cloudflare and allow Wrangler."
         wr login || die "Cloudflare sign-in did not finish"
@@ -267,6 +393,21 @@ cmd=$(node -e 'try { process.stdout.write(JSON.parse(process.argv[1]).install_co
 rm -f "$jar"
 [[ "$cmd" == *"/api/agent/install/"* ]] || die "the panel did not make an install command: $resp"
 save SERVER_NAME "$SERVER_NAME"
+
+# on a Linux server: install roomkey right here too
+if [[ "$(uname -s)" == Linux ]] && can_root; then
+    note ""
+    note "This computer is a Linux server: it can become \"$SERVER_NAME\" now. roomkey first checks it and"
+    note "refuses (changing nothing) if it already runs other proxies (3x-ui, Xray, Marzban…) or nginx."
+    if yes_no "Install roomkey on this server now?" y; then
+        if $SUDO sh -c "$cmd"; then
+            ok "this server is \"$SERVER_NAME\" in the panel: open $ADMIN_URL and create its nodes"
+            exit 0
+        fi
+        warn "the install above did not finish; the server was left as the check found it"
+        note "Fix what it names (or use a freshly installed VPS) and run the command below there."
+    fi
+fi
 
 cat <<EOF
 
