@@ -68,10 +68,33 @@ ask() {   # <var> <question> [default]
     if [[ -n "${3:-}" ]]; then read -r -p "  $2 [$3]: " v; v="${v:-$3}"; else read -r -p "  $2: " v; fi
     printf -v "$1" '%s' "$v"
 }
-ask_secret() {   # <var> <question>
-    local v
-    read -r -s -p "  $2: " v; echo
+ask_secret() {   # <var> <question> [letters to show]: typing shows the first few letters, then *
+    local v="" c rest show="${3:-0}"
+    if [[ ! -t 0 ]]; then read -r v; printf -v "$1" '%s' "$v"; return; fi
+    printf '  %s: ' "$2"
+    # echo stays off for the whole entry, so pasted text never shows between keystrokes
+    TTY_SAVED=$(stty -g); stty -echo
+    trap 'stty "$TTY_SAVED"; echo; exit 130' INT
+    while IFS= read -r -s -n1 c; do
+        case "$c" in
+            "") break ;;                                    # Enter
+            $'\177' | $'\b')                                # Backspace
+                if [[ -n "$v" ]]; then v="${v%?}"; printf '\b \b'; fi ;;
+            $'\025')                                        # Ctrl-U: start over
+                while [[ -n "$v" ]]; do v="${v%?}"; printf '\b \b'; done ;;
+            $'\033') read -r -s -n2 -t 1 rest || true ;;     # arrow keys and the like: ignored
+            [[:cntrl:]]) ;;
+            *)  v+="$c"
+                if (( ${#v} <= show )); then printf '%s' "$c"; else printf '*'; fi ;;
+        esac
+    done
+    stty "$TTY_SAVED"; trap - INT
+    echo
     printf -v "$1" '%s' "$v"
+}
+token_hint() {   # what was typed, for checking against the dashboard: "abcd…wxyz (40 characters)"
+    local t="$1"
+    (( ${#t} > 8 )) && printf '%s…%s (%d characters)' "${t:0:4}" "${t: -4}" "${#t}" || printf '%d characters' "${#t}"
 }
 yes_no() {   # <question> <default y|n> (--yes answers yes)
     (( YES )) && { printf '  %s [yes]\n' "$1"; return 0; }
@@ -234,7 +257,8 @@ elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not auth
         note "No browser here: use a Cloudflare API token. Create one at"
         note "  https://dash.cloudflare.com/profile/api-tokens → Create Token → \"Edit Cloudflare Workers\" template,"
         note "  then add: Account · D1 · Edit, and Zone · DNS · Edit for your domain."
-        ask_secret CLOUDFLARE_API_TOKEN "Cloudflare API token"
+        ask_secret CLOUDFLARE_API_TOKEN "Cloudflare API token (paste it)" 4
+        note "got $(token_hint "$CLOUDFLARE_API_TOKEN")"
         export CLOUDFLARE_API_TOKEN
         wr whoami >/dev/null 2>&1 || die "Cloudflare did not accept that token"
         ok "token accepted (it is not saved)"
@@ -274,7 +298,7 @@ if [[ "${DEPLOYED:-}" == 1 ]]; then
     note "Admin password: press Enter to keep the current one."
 fi
 while :; do
-    ask_secret ADMIN_PASSWORD "Admin password (8+ characters)"
+    ask_secret ADMIN_PASSWORD "Admin password (8+ characters)" 0
     if [[ -z "$ADMIN_PASSWORD" && "${DEPLOYED:-}" == 1 ]]; then ok "keeping the current password"; break; fi
     (( ${#ADMIN_PASSWORD} >= 8 )) || { warn "at least 8 characters"; continue; }
     ask_secret again "Again"
@@ -285,8 +309,9 @@ done
 CF_DNS_TOKEN=""
 note "Optional: a Cloudflare API token with Zone · DNS · Edit on the servers' domain lets the panel"
 note "keep each server's host name pointing at its IP. Press Enter to skip (you can add it later)."
-ask_secret CF_DNS_TOKEN "DNS token"
+ask_secret CF_DNS_TOKEN "DNS token" 4
 if [[ -n "$CF_DNS_TOKEN" ]]; then
+    note "got $(token_hint "$CF_DNS_TOKEN")"
     ask CF_ZONE_ID "That zone's ID (Cloudflare → the domain → Overview, right column)" "${CF_ZONE_ID:-}"
     save CF_ZONE_ID "$CF_ZONE_ID"
 fi
