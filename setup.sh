@@ -255,9 +255,20 @@ cf_json() {   # <node expression over j, the parsed answer>: prints its lines; "
     node -e '
         let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
           let j
-          try { j = JSON.parse(s) } catch { return console.log(`!no answer from api.cloudflare.com: ${s.trim().slice(0, 200)}`) }
+          try { j = JSON.parse(s) } catch { return console.log(`!~could not reach api.cloudflare.com: ${s.trim().slice(0, 200)}`) }
           if (!j.success) return console.log("!" + ((j.errors ?? []).map((e) => `${e.message} (code ${e.code})`).join("; ") || "no reason given"))
           const out = eval(process.argv[1]); if (out) console.log(out) })' "$1"
+}
+node_reaches_cf() {   # can Node (what Wrangler runs on) use the token? prints the reason when not
+    node -e '
+        fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+          headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }, signal: AbortSignal.timeout(15000) })
+          .then((r) => r.json())
+          .then((j) => { if (!j.success) { console.log(JSON.stringify(j.errors)); process.exit(1) } })
+          .catch((e) => { const c = e.cause ?? e; console.log(`${c.code ?? c.name ?? ""} ${c.message ?? e.message}`.trim()); process.exit(1) })'
+}
+cf_says() {   # <"!reason" from cf_json>
+    if [[ "$1" == '!~'* ]]; then warn "${1#!~}"; else warn "Cloudflare says: ${1#!}"; fi
 }
 cf_token_ok() {   # checks CLOUDFLARE_API_TOKEN and fills $accounts ("<id> <name>" lines); on a problem, says why
     local verify out
@@ -266,23 +277,36 @@ cf_token_ok() {   # checks CLOUDFLARE_API_TOKEN and fills $accounts ("<id> <name
     verify=$( { cf_api /user/tokens/verify || true; } | cf_json 'j.result?.status')
     if [[ "$verify" == active ]]; then
         accounts=$( { cf_api '/accounts?per_page=50' || true; } | cf_json 'j.result.map((a) => `${a.id} ${a.name}`).join("\n")')
-        if [[ "$accounts" == '!'* ]]; then warn "Cloudflare says: ${accounts#!}"; return 1; fi
+        if [[ "$accounts" == '!'* ]]; then cf_says "$accounts"; return 1; fi
         if [[ -z "$accounts" ]]; then
             warn "the token works, but it reaches no Cloudflare account."
             note "Edit the token: under Account Resources, include your account."
             return 1
         fi
+        # curl got through; Wrangler runs on Node, which connects differently (no IPv4 fallback, no curl proxy settings)
+        if ! out=$(node_reaches_cf 2>&1); then
+            if NODE_OPTIONS="--dns-result-order=ipv4first ${NODE_OPTIONS:-}" node_reaches_cf >/dev/null 2>&1; then
+                export NODE_OPTIONS="--dns-result-order=ipv4first ${NODE_OPTIONS:-}"
+                note "Node could not reach Cloudflare over IPv6 on this server; it uses IPv4 from here on."
+            else
+                warn "the token is valid (curl reached Cloudflare), but Node, which Wrangler runs on, could not: $out"
+                note "Something on this server (a proxy, firewall or DNS change) treats Node's traffic differently."
+                [[ -n "${https_proxy:-}${HTTPS_PROXY:-}${http_proxy:-}${HTTP_PROXY:-}" ]] &&
+                    note "A proxy is set in this shell (https_proxy/HTTPS_PROXY); try again without it, or with HTTPS_PROXY in capitals."
+                return 1
+            fi
+        fi
         return 0
     fi
     if [[ "$verify" != '!'* ]]; then warn "Cloudflare says the token is ${verify:-not usable}"; return 1; fi
-    if [[ "$verify" != *"code 1000"* ]]; then warn "Cloudflare says: ${verify#!}"; return 1; fi
+    if [[ "$verify" != *"code 1000"* ]]; then cf_says "$verify"; return 1; fi
     # "invalid" here can also mean an account-owned token, which only Wrangler can check
     if out=$(wr whoami --json 2>/dev/null); then
         accounts=$(node -e '
             try { for (const a of JSON.parse(process.argv[1]).accounts ?? []) console.log(`${a.id} ${a.name}`) } catch {}' "$out")
         [[ -n "$accounts" && "$accounts" != '!'* ]] && return 0
     fi
-    warn "Cloudflare says: ${verify#!}"
+    cf_says "$verify"
     note "Copy the token again with the copy button next to it; a missing or extra letter makes it invalid."
     return 1
 }
