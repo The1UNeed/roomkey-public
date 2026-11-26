@@ -495,11 +495,31 @@ step "Signing in to Cloudflare"
 if [[ $DRY == 1 ]]; then
     note "(skipped: dry run)"
 elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not authenticated'; then
-    if [[ -n "${SSH_CONNECTION:-}" || ( "$(uname -s)" == Linux && -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ) ]]; then
-        # no browser here (a server over SSH): an API token instead
-        note "No browser here: use a Cloudflare API token. Create one at"
-        note "  https://dash.cloudflare.com/profile/api-tokens → Create Token → \"Edit Cloudflare Workers\" template,"
-        note "  then add: Account · D1 · Edit, and Zone · DNS · Edit for your domain."
+    # a server (an SSH login, even after sudo, which drops SSH_CONNECTION) has no browser
+    remote=0
+    [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] && remote=1
+    who -m 2>/dev/null | grep -q '(' && remote=1
+    [[ "$(uname -s)" == Linux && -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && remote=1
+    note "How should roomkey sign in to Cloudflare?"
+    note "  1) paste an API token (on a server, or over SSH)"
+    note "  2) a browser window on this computer"
+    how=""
+    while :; do
+        ask how "Your choice, 1 or 2" "$( (( remote )) && echo 1 || echo 2 )"
+        [[ "$how" == 1 || "$how" == 2 ]] && break
+        warn "type 1 or 2"
+    done
+    if [[ "$how" == 2 ]]; then
+        note "A browser window opens: sign in to Cloudflare and allow Wrangler."
+        if ( cd "$PANEL" && npx --no-install wrangler login ); then ok "signed in"
+        else warn "the browser sign-in did not finish: use an API token instead"; how=1; fi
+    fi
+    if [[ "$how" == 1 ]]; then
+        note "Create a token at https://dash.cloudflare.com/profile/api-tokens → Create Token →"
+        note "\"Edit Cloudflare Workers\" template, and make sure it has:"
+        note "  Account · Workers Scripts · Edit    Account · D1 · Edit"
+        note "  Zone · Workers Routes · Edit        Zone · DNS · Edit   (with your domain's zone)"
+        note "and no Client IP Address Filtering. roomkey checks it and names anything missing."
         tries=0
         while :; do
             ask_secret CLOUDFLARE_API_TOKEN "Cloudflare API token (paste it)" 4
@@ -520,10 +540,6 @@ elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not auth
             ask CLOUDFLARE_ACCOUNT_ID "Account ID for the panel" "${CLOUDFLARE_ACCOUNT_ID:-$(head -1 <<<"$accounts" | cut -d' ' -f1)}"
         fi
         export CLOUDFLARE_ACCOUNT_ID; save CLOUDFLARE_ACCOUNT_ID "$CLOUDFLARE_ACCOUNT_ID"
-    else
-        note "A browser window opens: sign in to Cloudflare and allow Wrangler."
-        ( cd "$PANEL" && npx --no-install wrangler login ) || die "Cloudflare sign-in did not finish"
-        ok "signed in"
     fi
 else
     ok "already signed in: $(wr whoami 2>/dev/null | grep -iE 'email|associated' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-80)"
