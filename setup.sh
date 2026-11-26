@@ -70,7 +70,12 @@ note() { printf '  %s\n' "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '\n%s✗ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
 TTY_INIT=""; [[ -t 0 ]] && TTY_INIT=$(stty -g 2>/dev/null || true)
-tty_back() { [[ -n "$TTY_INIT" ]] && stty "$TTY_INIT" 2>/dev/null; true; }
+tty_back() {   # the terminal as it was, and no leftover keypresses (they would answer the next question)
+    [[ -n "$TTY_INIT" ]] || return 0
+    stty "$TTY_INIT" 2>/dev/null || true
+    if (( BASH_VERSINFO[0] >= 4 )); then while IFS= read -r -s -n 256 -t 0.05 _; do :; done; fi
+    return 0
+}
 ask() {   # <var> <question> [default]: Enter takes the default
     local v; tty_back
     if [[ -n "${3:-}" ]]; then read -r -p "  $2 [$3]: " v; v="${v:-$3}"; else read -r -p "  $2: " v; fi
@@ -79,6 +84,7 @@ ask() {   # <var> <question> [default]: Enter takes the default
 ask_secret() {   # <var> <question> [letters to show]: typing shows the first few letters, then *
     local v="" c rest show="${3:-0}"
     if [[ ! -t 0 ]]; then read -r v; printf -v "$1" '%s' "$v"; return; fi
+    tty_back
     # echo stays off for the whole entry, so pasted text never shows between keystrokes
     TTY_SAVED=$(stty -g); stty -echo
     trap 'stty "$TTY_SAVED"; echo; exit 130' INT
@@ -191,6 +197,18 @@ save() {   # remember an answer (no secrets here)
 }
 wr() { ( cd "$PANEL" && npx --no-install wrangler "$@" ) </dev/null; }   # never waits on a question
 export WRANGLER_SEND_METRICS=false
+wr_t() {   # <seconds> <wrangler args…>: wr, giving up after that long (once more over IPv4 first)
+    local t=$1 rc=0; shift
+    command -v timeout >/dev/null 2>&1 || { wr "$@"; return; }
+    ( cd "$PANEL" && timeout -k 10 "$t" npx --no-install wrangler "$@" ) </dev/null || rc=$?
+    if (( rc == 124 )) && [[ -z "${CF_IPV4:-}" ]]; then
+        warn "Wrangler got no answer from Cloudflare in ${t}s: trying again over IPv4" >&2
+        use_ipv4; rc=0
+        ( cd "$PANEL" && timeout -k 10 "$t" npx --no-install wrangler "$@" ) </dev/null || rc=$?
+    fi
+    (( rc == 124 )) && warn "Wrangler got no answer from Cloudflare in ${t}s" >&2
+    return "$rc"
+}
 
 rand_text() {   # <length> [characters, as tr knows them]: random text from /dev/urandom
     head -c 192 /dev/urandom | base64 | tr -dc "${2:-A-Za-z0-9}" | cut -c "1-$1"
@@ -394,6 +412,10 @@ zone_of() {   # <host>: "<zone id> <zone name>" of the zone holding it, as CF_DN
 cf_says() {   # <"!reason" from cf_json>
     if [[ "$1" == '!~'* ]]; then warn "${1#!~}"; else warn "Cloudflare says: ${1#!}"; fi
 }
+cf_post() {   # <path> <json>: POST to the Cloudflare API with the token
+    curl -sS ${CF_IPV4:+-4} --max-time 60 -X POST -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") \
+        -H 'content-type: application/json' --data-binary "$2" "https://api.cloudflare.com/client/v4$1" 2>&1
+}
 use_ipv4() {   # from here on, curl and Node (so Wrangler) reach Cloudflare over IPv4 only
     export CF_IPV4=1 NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection ${NODE_OPTIONS:-}"
 }
@@ -573,18 +595,34 @@ if [[ $DRY == 1 ]]; then
     DB_ID="${DB_ID:-00000000-0000-0000-0000-000000000000}"
     note "(dry run: the D1 database '$DB_NAME' would be created if missing)"
 else
-    DB_ID=$(wr d1 list --json 2>/dev/null | node -e '
-        let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
-          try { const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") } catch {} })' "$DB_NAME")
-    if [[ -z "$DB_ID" ]]; then
-        wr d1 create "$DB_NAME" --location apac --update-config=false >/dev/null || die "could not create the D1 database '$DB_NAME'"
-        DB_ID=$(wr d1 list --json | node -e '
-            let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
-              const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") })' "$DB_NAME")
-        [[ -n "$DB_ID" ]] || die "the new database did not show up"
-        ok "created the D1 database '$DB_NAME' (new and empty)"
+    note "Looking for the D1 database '$DB_NAME' on your Cloudflare account …"
+    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+        # with a token, straight from Cloudflare's API: quick, and it says why when it cannot
+        d1=/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database
+        DB_ID=$( { cf_api "$d1?name=$DB_NAME&per_page=100" || true; } |
+            DBN="$DB_NAME" cf_json '(j.result ?? []).filter((d) => d.name === process.env.DBN).map((d) => d.uuid)[0] ?? ""')
+        [[ "$DB_ID" == '!'* ]] && { cf_says "$DB_ID"; die "could not list the D1 databases (the token needs Account · D1 · Edit)"; }
+        if [[ -z "$DB_ID" ]]; then
+            DB_ID=$( { cf_post "$d1" "{\"name\":\"$DB_NAME\",\"primary_location_hint\":\"apac\"}" || true; } | cf_json 'j.result?.uuid ?? ""')
+            [[ -n "$DB_ID" && "$DB_ID" != '!'* ]] || { cf_says "${DB_ID:-!no answer}"; die "could not create the D1 database '$DB_NAME'"; }
+            ok "created the D1 database '$DB_NAME' (new and empty)"
+        else
+            ok "D1 database '$DB_NAME' is there"
+        fi
     else
-        ok "D1 database '$DB_NAME' is there"
+        DB_ID=$(wr_t 120 d1 list --json 2>/dev/null | node -e '
+            let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+              try { const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") } catch {} })' "$DB_NAME")
+        if [[ -z "$DB_ID" ]]; then
+            wr_t 120 d1 create "$DB_NAME" --location apac --update-config=false >/dev/null || die "could not create the D1 database '$DB_NAME'"
+            DB_ID=$(wr_t 120 d1 list --json | node -e '
+                let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+                  const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") })' "$DB_NAME")
+            [[ -n "$DB_ID" ]] || die "the new database did not show up"
+            ok "created the D1 database '$DB_NAME' (new and empty)"
+        else
+            ok "D1 database '$DB_NAME' is there"
+        fi
     fi
 fi
 save DB_NAME "$DB_NAME"
@@ -606,7 +644,7 @@ ok "panel/wrangler.local.jsonc: $ADMIN_HOST (admin), $SUB_HOST (subscriptions, s
 send_key=0
 if [[ -s "$KEY_FILE" ]]; then
     send_key=1
-elif [[ $DRY == 0 && "${DEPLOYED:-}" == 1 ]] && wr secret list -c wrangler.local.jsonc 2>/dev/null | grep -q '"TOKEN_KEY"'; then
+elif [[ $DRY == 0 && "${DEPLOYED:-}" == 1 ]] && wr_t 60 secret list -c wrangler.local.jsonc 2>/dev/null | grep -q '"TOKEN_KEY"'; then
     warn "the panel already has a TOKEN_KEY that is not in $KEY_FILE: keeping it as it is"
 else
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
@@ -631,7 +669,8 @@ if [[ $DRY == 1 ]]; then
     note "(dry run) would run: npx wrangler deploy -c panel/wrangler.local.jsonc --secrets-file <temporary file>"
     note "the secrets file would set: $(node -e 'console.log(Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1]))).join(", ") || "nothing")' "$secrets")"
 else
-    wr deploy -c wrangler.local.jsonc --secrets-file "$secrets" || die "the deploy failed (above). A custom domain needs its domain on this Cloudflare account."
+    note "Uploading the panel and its secrets (about a minute) …"
+    wr_t 600 deploy -c wrangler.local.jsonc --secrets-file "$secrets" || die "the deploy failed (above). A custom domain needs its domain on this Cloudflare account."
     save DEPLOYED 1
     ok "deployed"
 fi
