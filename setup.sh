@@ -71,10 +71,10 @@ ask() {   # <var> <question> [default]
 ask_secret() {   # <var> <question> [letters to show]: typing shows the first few letters, then *
     local v="" c rest show="${3:-0}"
     if [[ ! -t 0 ]]; then read -r v; printf -v "$1" '%s' "$v"; return; fi
-    printf '  %s: ' "$2"
     # echo stays off for the whole entry, so pasted text never shows between keystrokes
     TTY_SAVED=$(stty -g); stty -echo
     trap 'stty "$TTY_SAVED"; echo; exit 130' INT
+    printf '  %s: ' "$2"
     while IFS= read -r -s -n1 c; do
         case "$c" in
             "") break ;;                                    # Enter
@@ -247,6 +247,46 @@ if [[ ! -d "$PANEL/node_modules" || "$PANEL/package-lock.json" -nt "$PANEL/node_
 fi
 ok "panel/node_modules ($(wr --version 2>/dev/null | tail -1 | tr -d ' ' || echo wrangler))"
 
+cf_api() {   # <path>: GET from the Cloudflare API with the token (kept out of the process list)
+    curl -sS --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") \
+        "https://api.cloudflare.com/client/v4$1" 2>&1
+}
+cf_json() {   # <node expression over j, the parsed answer>: prints its lines; "!reason" when Cloudflare said no
+    node -e '
+        let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+          let j
+          try { j = JSON.parse(s) } catch { return console.log(`!no answer from api.cloudflare.com: ${s.trim().slice(0, 200)}`) }
+          if (!j.success) return console.log("!" + ((j.errors ?? []).map((e) => `${e.message} (code ${e.code})`).join("; ") || "no reason given"))
+          const out = eval(process.argv[1]); if (out) console.log(out) })' "$1"
+}
+cf_token_ok() {   # checks CLOUDFLARE_API_TOKEN and fills $accounts ("<id> <name>" lines); on a problem, says why
+    local verify out
+    if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then warn "nothing was pasted"; return 1; fi
+    # Cloudflare's own verdict on the token: active, expired, disabled, invalid…
+    verify=$( { cf_api /user/tokens/verify || true; } | cf_json 'j.result?.status')
+    if [[ "$verify" == active ]]; then
+        accounts=$( { cf_api '/accounts?per_page=50' || true; } | cf_json 'j.result.map((a) => `${a.id} ${a.name}`).join("\n")')
+        if [[ "$accounts" == '!'* ]]; then warn "Cloudflare says: ${accounts#!}"; return 1; fi
+        if [[ -z "$accounts" ]]; then
+            warn "the token works, but it reaches no Cloudflare account."
+            note "Edit the token: under Account Resources, include your account."
+            return 1
+        fi
+        return 0
+    fi
+    if [[ "$verify" != '!'* ]]; then warn "Cloudflare says the token is ${verify:-not usable}"; return 1; fi
+    if [[ "$verify" != *"code 1000"* ]]; then warn "Cloudflare says: ${verify#!}"; return 1; fi
+    # "invalid" here can also mean an account-owned token, which only Wrangler can check
+    if out=$(wr whoami --json 2>/dev/null); then
+        accounts=$(node -e '
+            try { for (const a of JSON.parse(process.argv[1]).accounts ?? []) console.log(`${a.id} ${a.name}`) } catch {}' "$out")
+        [[ -n "$accounts" && "$accounts" != '!'* ]] && return 0
+    fi
+    warn "Cloudflare says: ${verify#!}"
+    note "Copy the token again with the copy button next to it; a missing or extra letter makes it invalid."
+    return 1
+}
+
 # ── 3. Cloudflare account ─────────────────────────────────────────────────────
 step "Signing in to Cloudflare"
 if [[ $DRY == 1 ]]; then
@@ -257,21 +297,26 @@ elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not auth
         note "No browser here: use a Cloudflare API token. Create one at"
         note "  https://dash.cloudflare.com/profile/api-tokens → Create Token → \"Edit Cloudflare Workers\" template,"
         note "  then add: Account · D1 · Edit, and Zone · DNS · Edit for your domain."
-        ask_secret CLOUDFLARE_API_TOKEN "Cloudflare API token (paste it)" 4
-        note "got $(token_hint "$CLOUDFLARE_API_TOKEN")"
-        export CLOUDFLARE_API_TOKEN
-        wr whoami >/dev/null 2>&1 || die "Cloudflare did not accept that token"
+        tries=0
+        while :; do
+            ask_secret CLOUDFLARE_API_TOKEN "Cloudflare API token (paste it)" 4
+            note "got $(token_hint "$CLOUDFLARE_API_TOKEN")"
+            export CLOUDFLARE_API_TOKEN
+            cf_token_ok && break
+            (( ++tries < 3 )) || die "Cloudflare did not accept the token (the reason is above)"
+            note "Paste it again (or a new token), or press Ctrl-C to stop."
+        done
         ok "token accepted (it is not saved)"
-        # a token for more than one account: which one gets the panel
-        accounts=$(wr whoami --json 2>/dev/null | node -e '
-            let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
-              try { for (const a of JSON.parse(s).accounts ?? []) console.log(`${a.id} ${a.name}`) } catch {} })')
-        if (( $(grep -c . <<<"$accounts") > 1 )); then
+        # which account gets the panel (named up front, so Wrangler needs no extra permissions to find it)
+        if (( $(grep -c . <<<"$accounts") == 1 )); then
+            CLOUDFLARE_ACCOUNT_ID=${accounts%% *}
+            note "account: ${accounts#* } (${CLOUDFLARE_ACCOUNT_ID})"
+        else
             note "This token reaches several Cloudflare accounts:"
             while read -r id name; do note "  $id  $name"; done <<<"$accounts"
             ask CLOUDFLARE_ACCOUNT_ID "Account ID for the panel" "${CLOUDFLARE_ACCOUNT_ID:-$(head -1 <<<"$accounts" | cut -d' ' -f1)}"
-            export CLOUDFLARE_ACCOUNT_ID; save CLOUDFLARE_ACCOUNT_ID "$CLOUDFLARE_ACCOUNT_ID"
         fi
+        export CLOUDFLARE_ACCOUNT_ID; save CLOUDFLARE_ACCOUNT_ID "$CLOUDFLARE_ACCOUNT_ID"
     else
         note "A browser window opens: sign in to Cloudflare and allow Wrangler."
         wr login || die "Cloudflare sign-in did not finish"
