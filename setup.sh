@@ -238,14 +238,14 @@ panel_install_command() {   # <admin url> <username> <password> <server name>
     jar=$(mktemp)
     code=$(printf '{"username":%s,"password":%s}' "$(json_str "$2")" "$(json_str "$3")" |
         curl -sS -c "$jar" -o /dev/null -w '%{http_code}' --max-time 20 -H 'content-type: application/json' \
-            --data-binary @- "$url/api/login" 2>/dev/null) || true
+            --data-binary @- "$url/api/login" 2>"$jar.err") || true
     case "$code" in
         200) ;;
         401) PANEL_ERR="the panel did not accept that username and password" ;;
         429) PANEL_ERR="too many failed sign-ins from this address: wait 15 minutes" ;;
         404) PANEL_ERR="$url is not a roomkey admin page (use the admin address, not the subscription one)" ;;
         503) PANEL_ERR="that panel has no admin password set yet" ;;
-        *)   PANEL_ERR="could not reach $url (HTTP ${code:-000})" ;;
+        *)   PANEL_ERR="could not reach $url: $(sed -n 's/^curl: ([0-9]*) //p' "$jar.err" | head -1)" ;;
     esac
     if [[ -z "$PANEL_ERR" ]]; then
         resp=$(curl -sS -b "$jar" --max-time 20 -H 'content-type: application/json' \
@@ -254,7 +254,7 @@ panel_install_command() {   # <admin url> <username> <password> <server name>
         [[ "$INSTALL_CMD" == *"/api/agent/install/"* || "$INSTALL_CMD" == *"bootstrap"* ]] ||
             { INSTALL_CMD=""; PANEL_ERR="the panel did not make an install command: $(json_field message "$resp" || true)"; }
     fi
-    rm -f "$jar"
+    rm -f "$jar" "$jar.err"
     [[ -n "$INSTALL_CMD" ]]
 }
 install_here() {   # runs INSTALL_CMD as root; says what happened
