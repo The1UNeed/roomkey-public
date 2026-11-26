@@ -686,8 +686,10 @@ ok "panel/wrangler.local.jsonc: $ADMIN_HOST (admin), $SUB_HOST (subscriptions, s
 send_key=0
 if [[ -s "$KEY_FILE" ]]; then
     send_key=1
-elif [[ $DRY == 0 && "${DEPLOYED:-}" == 1 ]] && wr_t 60 secret list -c wrangler.local.jsonc 2>/dev/null | grep -q '"TOKEN_KEY"'; then
-    warn "the panel already has a TOKEN_KEY that is not in $KEY_FILE: keeping it as it is"
+elif [[ $DRY == 0 ]] && wr_t 60 secret list -c wrangler.local.jsonc 2>/dev/null | grep -q '"TOKEN_KEY"'; then
+    # deployed from another computer: its key stays (a new one would make the panel's data unreadable)
+    warn "the panel already has an encryption key (TOKEN_KEY), made on another computer: keeping it."
+    note "Its copy is in ~/.roomkey/token-key on the computer that first deployed the panel."
 else
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
     ( umask 077; openssl rand -base64 32 >"$KEY_FILE" )
