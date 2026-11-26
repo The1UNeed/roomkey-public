@@ -32,12 +32,14 @@ watch(page, (p) => { document.title = `${p.label} · roomkey` }, { immediate: tr
 const auth = ref<'loading' | 'signed-in' | 'signed-out'>('loading')
 const configured = ref(true)
 const passwordIgnored = ref(false)
+const usernameRequired = ref(false)
 const version = ref('')
 async function checkSession() {
   try {
-    const s = await api<{ configured: boolean; authenticated: boolean; version: string; password_ignored?: boolean }>('/api/session')
+    const s = await api<{ configured: boolean; authenticated: boolean; version: string; password_ignored?: boolean; username_required?: boolean }>('/api/session')
     configured.value = s.configured
     passwordIgnored.value = !!s.password_ignored
+    usernameRequired.value = !!s.username_required
     version.value = s.version
     auth.value = s.authenticated ? 'signed-in' : 'signed-out'
   } catch {
@@ -70,7 +72,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <Login v-if="auth === 'signed-out'" :configured="configured" :password-ignored="passwordIgnored" @done="auth = 'signed-in'" />
+  <Login v-if="auth === 'signed-out'" :configured="configured" :password-ignored="passwordIgnored" :username-required="usernameRequired" @done="auth = 'signed-in'" />
   <div v-else-if="auth === 'signed-in'" class="layout" :class="{ 'menu-open': menuOpen }">
     <aside class="sidebar">
       <a class="brand" href="#/dashboard"><img class="brand-logo" src="/logo.svg" alt="" data-test="logo"> roomkey

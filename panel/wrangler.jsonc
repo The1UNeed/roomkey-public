@@ -36,7 +36,7 @@
   // Logs, but no invocation logs: those record each request's URL, and a
   // subscription URL is its user's key
   "observability": { "enabled": true, "logs": { "invocation_logs": false } }
-  // Secrets (never in this file): ADMIN_PASSWORD (required), TOKEN_KEY (optional),
+  // Secrets (never in this file): ADMIN_PASSWORD (required), ADMIN_USERNAME (optional), TOKEN_KEY (optional),
   // CF_DNS_TOKEN (optional: Zone · DNS · Edit, for servers' host names).
   // Variables to set when deploying: INSTALL_URL and PSM_REPO (docs/DEPLOY.md
   // step 0), CF_ZONE_ID (optional)

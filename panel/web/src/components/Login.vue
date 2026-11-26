@@ -3,24 +3,26 @@ import { nextTick, ref } from 'vue'
 import { api, ApiError } from '../api'
 import Footer from './Footer.vue'
 
-defineProps<{ configured: boolean; passwordIgnored?: boolean }>()
+const props = defineProps<{ configured: boolean; passwordIgnored?: boolean; usernameRequired?: boolean }>()
 const emit = defineEmits<{ (e: 'done'): void }>()
 
+const username = ref('')
 const password = ref('')
 const error = ref('')
 const busy = ref(false)
 const field = ref<HTMLInputElement | null>(null)
+const ready = () => !!password.value && (!props.usernameRequired || !!username.value.trim())
 
 async function submit() {
   busy.value = true
   error.value = ''
   try {
-    await api('/api/login', { method: 'POST', body: JSON.stringify({ password: password.value }) })
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ username: username.value, password: password.value }) })
     password.value = ''
     emit('done')
   } catch (e) {
     const status = e instanceof ApiError ? e.status : 0
-    error.value = status === 401 ? '密码不对' : status === 429 ? '失败次数太多，请 15 分钟后再试' : (e as Error).message
+    error.value = status === 401 ? (props.usernameRequired ? '用户名或密码不对' : '密码不对') : status === 429 ? '失败次数太多，请 15 分钟后再试' : (e as Error).message
     // a wrong password does not stay in the field (nor in the page's memory)
     password.value = ''
     await nextTick()
@@ -36,13 +38,18 @@ async function submit() {
     <form class="card login-card" @submit.prevent="submit">
       <div class="brand"><img class="brand-logo" src="/logo.svg" alt=""> roomkey</div>
       <template v-if="configured">
+        <div v-if="usernameRequired" class="field">
+          <label for="username">用户名</label>
+          <input id="username" v-model="username" class="input" type="text" autocomplete="username" autocapitalize="none"
+                 spellcheck="false" autofocus data-test="username" />
+        </div>
         <div class="field">
           <label for="password">管理员密码</label>
           <input id="password" ref="field" v-model="password" class="input" type="password" autocomplete="current-password"
-                 autofocus data-test="password" />
+                 :autofocus="!usernameRequired" data-test="password" />
         </div>
         <div v-if="error" class="errors" role="alert" data-test="login-error">{{ error }}</div>
-        <button class="btn primary login-btn" type="submit" :disabled="busy || !password" data-test="login">
+        <button class="btn primary login-btn" type="submit" :disabled="busy || !ready()" data-test="login">
           <span v-if="busy" class="spinner" />登录
         </button>
       </template>

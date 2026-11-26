@@ -15,7 +15,8 @@ async function admin(method, path, body) {
 }
 const get = (path, headers = {}) => fetch(PUBLIC + path, { headers })
 
-ok((await admin('POST', '/api/login', { password: 'roomkey-e2e-pass' })).status === 200, 'admin signs in')
+ok((await admin('GET', '/api/session')).data.username_required === false, 'without ADMIN_USERNAME (older deploys): no username asked')
+ok((await admin('POST', '/api/login', { password: 'roomkey-e2e-pass' })).status === 200, 'admin signs in with the password alone')
 const srv = await admin('POST', '/api/servers', { name: 'vm1' })
 const cmd = srv.data.install_command ?? ''
 const m = /\/api\/agent\/install\/([A-Za-z0-9_-]+) \|\| wget/.exec(cmd)

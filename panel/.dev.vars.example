@@ -1,3 +1,5 @@
 # The admin password for the panel (8+ characters). The Deploy to Cloudflare
 # form asks for it; for `wrangler dev`, copy this file to .dev.vars.
 ADMIN_PASSWORD=
+# optional: when set, sign-in asks for this username too
+ADMIN_USERNAME=

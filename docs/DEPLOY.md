@@ -4,18 +4,20 @@ What you need to put roomkey into service. The code is built and tested locally 
 
 ## Quick start: `setup.sh`
 
-One command on your computer (macOS, or Linux with Node.js 20+ and git):
+One command on your computer or a Linux server (it installs git, curl and Node.js 22 when they are missing):
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/The1UNeed/roomkey-public/main/setup.sh)
 ```
 
-(From a checkout: `./setup.sh`.) On a machine without a browser (a server over SSH) it asks for a Cloudflare API token instead of opening the sign-in page. Without Go it takes psm-agent from the published release.
+(From a checkout: `./setup.sh`.) It first asks whether to set up a **new panel** (below) or to **connect this server to a panel you already have** (`./setup.sh --join`: the admin address, username and password, or an install command copied from the panel; then it adds this server and installs it). Every question shows a suggestion in [brackets]; Enter takes it.
 
-It checks the tools (Node 20+, git; Go optional; `brew install node` if missing), signs you in to Cloudflare (a browser window), asks for the two addresses (admin, subscriptions), the admin password and an optional DNS token, then:
+On a machine without a browser (a server over SSH) it asks for a Cloudflare API token instead of opening the sign-in page; it says why when Cloudflare refuses one (a token limited to some IP addresses gets tried over IPv4 first). Without Go it takes psm-agent from the published release.
+
+For a new panel it checks and installs the tools, offers the system's updates, signs you in to Cloudflare, asks for the two addresses (admin, subscriptions), the admin username (a random `admin-xxxx` by default) and password (Enter makes a random 20-character one; both are kept in `~/.roomkey/admin-login`, readable only by you) and an optional DNS token (its zone is found by itself), then:
 
 1. builds what servers download: PSM's scripts from the last commit and psm-agent for amd64 / arm64 / armv7, with their SHA256SUMS;
-2. creates the D1 database `roomkey` if it is missing, writes `panel/wrangler.local.jsonc` (not committed) with your addresses as custom domains, and deploys the Worker with its secrets (`ADMIN_PASSWORD`, `TOKEN_KEY` made once and kept in `~/.roomkey/token-key` — back it up — and `CF_DNS_TOKEN` if given);
+2. creates the D1 database `roomkey` if it is missing, writes `panel/wrangler.local.jsonc` (not committed) with your addresses as custom domains, and deploys the Worker with its secrets (`ADMIN_USERNAME`, `ADMIN_PASSWORD`, `TOKEN_KEY` made once and kept in `~/.roomkey/token-key` — back it up — and `CF_DNS_TOKEN` if given);
 3. waits for the admin address to answer, makes your first server in the panel and prints its install command.
 
 Run it again after pulling changes: it remembers the answers (`~/.roomkey/setup.env`) and only rebuilds and redeploys. `./setup.sh --dry-run` does everything except talk to Cloudflare.
@@ -41,6 +43,7 @@ cd panel
 npm ci
 npx wrangler login
 npx wrangler secret put ADMIN_PASSWORD      # 8+ characters
+npx wrangler secret put ADMIN_USERNAME      # optional: when set, sign-in asks for it too
 npx wrangler secret put TOKEN_KEY           # openssl rand -base64 32 — keep a copy somewhere safe
 npx wrangler secret put CF_DNS_TOKEN        # optional, see below
 # variables (wrangler.jsonc "vars", or the dashboard): ADMIN_HOSTS (set to admin.myroom.asia),

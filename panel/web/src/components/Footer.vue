@@ -3,11 +3,13 @@
 // it is built on.
 const REPO = 'https://github.com/The1UNeed/roomkey-public'
 const UPSTREAM = 'https://github.com/jinqians/proxy-stack'
+const NOTICE = `${REPO}/blob/main/NOTICE`
 </script>
 
 <template>
   <footer class="footer" data-test="footer">
     <a :href="REPO" target="_blank" rel="noopener noreferrer" data-test="source">roomkey</a> ·
-    built on <a :href="UPSTREAM" target="_blank" rel="noopener noreferrer" data-test="powered-by">PSM</a>
+    built on <a :href="UPSTREAM" target="_blank" rel="noopener noreferrer" data-test="powered-by">PSM</a> ·
+    <a :href="NOTICE" target="_blank" rel="noopener noreferrer" data-test="license">AGPL-3.0</a>
   </footer>
 </template>

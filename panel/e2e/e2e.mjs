@@ -71,7 +71,12 @@ ok((await fetch(`${PUBLIC}/`)).status === 404, 'nor the admin page')
 ok((await fetch(`${BASE}/`)).status === 200, 'the admin host name serves the page')
 
 // ── sign in, a server, its agent ──
-ok((await admin('POST', '/api/login', { password: 'roomkey-e2e-pass' })).status === 200, 'admin signs in')
+const sess = (await admin('GET', '/api/session')).data
+ok(sess.username_required === true, 'with ADMIN_USERNAME set, the sign-in page asks for a username')
+ok((await admin('POST', '/api/login', { password: 'roomkey-e2e-pass' })).status === 401, 'the right password without the username: refused')
+ok((await admin('POST', '/api/login', { username: 'someone', password: 'roomkey-e2e-pass' })).status === 401, 'a wrong username: refused')
+ok((await admin('POST', '/api/login', { username: 'admin-e2e', password: 'nope-nope-nope' })).status === 401, 'a wrong password: refused')
+ok((await admin('POST', '/api/login', { username: ' admin-E2E ', password: 'roomkey-e2e-pass' })).status === 200, 'admin signs in (username in any case, spaces ignored)')
 const srv = await admin('POST', '/api/servers', { name: 'hk1' })
 ok(srv.status === 201 && /--repo https:\/\/github\.com\/example\/roomkey-stack/.test(srv.data.install_command), 'install command carries INSTALL_URL and --repo', srv.data.install_command)
 const joinToken = /--join (\S+)/.exec(srv.data.install_command)[1]

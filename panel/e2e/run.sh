@@ -10,7 +10,7 @@ PORT="${E2E_PORT:-58384}"; MOCK_PORT="${E2E_MOCK_PORT:-58385}"
 rm -rf "$E2E/state"
 E2E_MOCK_PORT="$MOCK_PORT" node "$E2E/mock.mjs" & mock=$!
 ( cd "$PANEL" && NO_BUNDLE=1 npm run build >/dev/null 2>&1 && exec npx wrangler dev --local --port "$PORT" --persist-to "$E2E/state" --test-scheduled \
-    --var ADMIN_PASSWORD:roomkey-e2e-pass --var SYNC_INTERVAL:5 \
+    --var ADMIN_PASSWORD:roomkey-e2e-pass --var ADMIN_USERNAME:Admin-e2e --var SYNC_INTERVAL:5 \
     --var CF_DNS_TOKEN:cf-test-token --var CF_ZONE_ID:zone1 --var "CF_API_BASE:http://127.0.0.1:$MOCK_PORT" --var "TELEGRAM_API_BASE:http://127.0.0.1:$MOCK_PORT" \
     --var ADMIN_HOSTS:localhost --var INSTALL_URL:https://raw.githubusercontent.com/example/roomkey-stack/main/bootstrap.sh --var PSM_REPO:https://github.com/example/roomkey-stack ) > "$E2E/wrangler.log" 2>&1 &
 pid=$!

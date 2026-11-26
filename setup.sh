@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # roomkey setup — puts the panel on your Cloudflare account and gives you the
-# command that installs your first server. Run it from this repository:
+# command that installs your first server, or connects this server to a panel
+# you already have. Run it from this repository:
 #
-#   ./setup.sh            guided: asks a few questions, then does everything
-#   ./setup.sh --yes      the same, answering "yes" to installing tools and updates
-#   ./setup.sh --dry-run  everything up to Cloudflare (tools, bundle, config), nothing sent
+#   ./setup.sh            guided: asks what you want, a few questions, then does everything
+#   ./setup.sh --join     connect this server to an existing panel (only needs curl)
+#   ./setup.sh --yes      answer "yes" to installing tools and updates
+#   ./setup.sh --dry-run  a new panel up to Cloudflare (tools, bundle, config), nothing sent
+#
+# Every question shows its suggestion in [brackets]: press Enter to take it.
 #
 # What it installs when missing: git, curl, openssl, tar (the system's package
 # manager, with sudo when not root) and Node.js 22 (the official build, checked
@@ -46,12 +50,14 @@ STATE_DIR="${ROOMKEY_HOME:-$HOME/.roomkey}"
 ENV_FILE="$STATE_DIR/setup.env"
 KEY_FILE="$STATE_DIR/token-key"
 LOCAL_CFG="$PANEL/wrangler.local.jsonc"
-DRY=0; YES=0
+LOGIN_FILE="$STATE_DIR/admin-login"   # the admin's username and password (mode 600), for later runs
+DRY=0; YES=0; MODE=""
 for a in "$@"; do
     case "$a" in
-        --dry-run) DRY=1 ;;
+        --dry-run) DRY=1; MODE="new" ;;
+        --join) MODE="join" ;;
         --yes|-y) YES=1 ;;
-        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -63,8 +69,10 @@ ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 note() { printf '  %s\n' "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '\n%s✗ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
-ask() {   # <var> <question> [default]
-    local v
+TTY_INIT=""; [[ -t 0 ]] && TTY_INIT=$(stty -g 2>/dev/null || true)
+tty_back() { [[ -n "$TTY_INIT" ]] && stty "$TTY_INIT" 2>/dev/null; true; }
+ask() {   # <var> <question> [default]: Enter takes the default
+    local v; tty_back
     if [[ -n "${3:-}" ]]; then read -r -p "  $2 [$3]: " v; v="${v:-$3}"; else read -r -p "  $2: " v; fi
     printf -v "$1" '%s' "$v"
 }
@@ -92,13 +100,13 @@ ask_secret() {   # <var> <question> [letters to show]: typing shows the first fe
     echo
     printf -v "$1" '%s' "$v"
 }
-token_hint() {   # what was typed, for checking against the dashboard: "abcd…wxyz (40 characters)"
+token_hint() {   # what was typed, for checking against the dashboard: "abcd...wxyz (40 characters)"
     local t="$1"
-    (( ${#t} > 8 )) && printf '%s…%s (%d characters)' "${t:0:4}" "${t: -4}" "${#t}" || printf '%d characters' "${#t}"
+    (( ${#t} > 8 )) && printf '%s...%s (%d characters)' "${t:0:4}" "${t: -4}" "${#t}" || printf '%d characters' "${#t}"
 }
 yes_no() {   # <question> <default y|n> (--yes answers yes)
     (( YES )) && { printf '  %s [yes]\n' "$1"; return 0; }
-    local v; read -r -p "  $1 [$( [[ $2 == y ]] && echo Y/n || echo y/N )]: " v
+    local v; tty_back; read -r -p "  $1 [$( [[ $2 == y ]] && echo Y/n || echo y/N )]: " v
     v="${v:-$2}"; [[ "$v" =~ ^[Yy] ]]
 }
 
@@ -181,15 +189,121 @@ save() {   # remember an answer (no secrets here)
     grep -v "^$1=" "$ENV_FILE" >"$ENV_FILE.tmp" 2>/dev/null || true
     printf '%s=%q\n' "$1" "$2" >>"$ENV_FILE.tmp"; mv "$ENV_FILE.tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
 }
-wr() { ( cd "$PANEL" && npx --no-install wrangler "$@" ); }
+wr() { ( cd "$PANEL" && npx --no-install wrangler "$@" ) </dev/null; }   # never waits on a question
+export WRANGLER_SEND_METRICS=false
+
+rand_text() {   # <length> [characters, as tr knows them]: random text from /dev/urandom
+    head -c 192 /dev/urandom | base64 | tr -dc "${2:-A-Za-z0-9}" | cut -c "1-$1"
+}
+json_str() { local t=$1; t=${t//\\/\\\\}; t=${t//\"/\\\"}; printf '"%s"' "$t"; }
+json_field() {   # <name> <json>: the first string field of that name (no quotes inside it)
+    sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" <<<"$2" | head -1
+}
+panel_url() {   # <what was typed>: https://host[:port] (http:// only when typed so), or nothing
+    local u=${1%%[[:space:]]}
+    [[ "$u" == http://* || "$u" == https://* ]] || u="https://$u"
+    u=$(sed -E 's#^(https?://[^/]+).*#\1#' <<<"$u")
+    [[ "$u" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] && printf '%s' "$u"
+}
+default_server_name() {   # this machine's host name, as the panel takes it; else server-xxxx
+    local h; h=$(hostname 2>/dev/null | cut -d. -f1 | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9-' | sed 's/^-*//' | cut -c1-31)
+    [[ "$h" =~ ^[a-z0-9][a-z0-9-]*$ && "$h" != localhost ]] && printf '%s' "$h" || printf 'server-%s' "$(rand_text 4 a-z0-9)"
+}
+# Signs in to a panel and adds a server: INSTALL_CMD on success, PANEL_ERR (and 1) when not.
+# The password goes to curl on stdin, never on its command line.
+panel_install_command() {   # <admin url> <username> <password> <server name>
+    local url=$1 jar code resp
+    INSTALL_CMD=""; PANEL_ERR=""
+    jar=$(mktemp)
+    code=$(printf '{"username":%s,"password":%s}' "$(json_str "$2")" "$(json_str "$3")" |
+        curl -sS -c "$jar" -o /dev/null -w '%{http_code}' --max-time 20 -H 'content-type: application/json' \
+            --data-binary @- "$url/api/login" 2>/dev/null) || true
+    case "$code" in
+        200) ;;
+        401) PANEL_ERR="the panel did not accept that username and password" ;;
+        429) PANEL_ERR="too many failed sign-ins from this address: wait 15 minutes" ;;
+        404) PANEL_ERR="$url is not a roomkey admin page (use the admin address, not the subscription one)" ;;
+        503) PANEL_ERR="that panel has no admin password set yet" ;;
+        *)   PANEL_ERR="could not reach $url (HTTP ${code:-000})" ;;
+    esac
+    if [[ -z "$PANEL_ERR" ]]; then
+        resp=$(curl -sS -b "$jar" --max-time 20 -H 'content-type: application/json' \
+            --data-binary "{\"name\":$(json_str "$4")}" "$url/api/servers" 2>&1) || true
+        INSTALL_CMD=$(json_field install_command "$resp")
+        [[ "$INSTALL_CMD" == *"/api/agent/install/"* || "$INSTALL_CMD" == *"bootstrap"* ]] ||
+            { INSTALL_CMD=""; PANEL_ERR="the panel did not make an install command: $(json_field message "$resp" || true)"; }
+    fi
+    rm -f "$jar"
+    [[ -n "$INSTALL_CMD" ]]
+}
+install_here() {   # runs INSTALL_CMD as root; says what happened
+    note "roomkey first checks this server and refuses (changing nothing) if it already runs other"
+    note "proxies (3x-ui, Xray, Marzban…) or nginx."
+    if $SUDO sh -c "$INSTALL_CMD"; then return 0; fi
+    warn "the install above did not finish; the server was left as the check found it"
+    return 1
+}
+
+# ── connecting this server to a panel you already have ──────────────────────
+join_existing_panel() {
+    local input url user="" pass name tries=0
+    step "Connecting this server to your roomkey panel"
+    [[ "$(uname -s)" == Linux ]] || die "run this on the Linux server you want to connect"
+    can_root || die "connecting a server needs root (or sudo)"
+    if ! command -v curl >/dev/null 2>&1; then
+        note "Installing curl …"
+        pkg_refresh || true
+        pkg_install curl ca-certificates || pkg_install curl || die "curl could not be installed"
+    fi
+    note "You need your panel's admin address and sign-in, or an install command copied from the"
+    note "panel (服务器 → 添加服务器). Press Enter to take a suggestion in [brackets]."
+    ask input "Admin address, or paste an install command" "${ADMIN_HOST:-}"
+    if [[ "$input" == *"/api/agent/install/"* || "$input" == *"bootstrap.sh"*"--join"* ]]; then
+        INSTALL_CMD=$input
+    else
+        url=$(panel_url "$input") || die "not an address: $input"
+        name=$(default_server_name)
+        while :; do
+            ask user "Admin username (Enter if your panel has none)" "${user:-${ADMIN_USER:-}}"
+            ask_secret pass "Admin password" 0
+            while :; do
+                ask name "A name for this server (letters, digits, -)" "$name"
+                [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,30}$ ]] && break
+                warn "letters, digits and -, up to 31"
+            done
+            panel_install_command "$url" "$user" "$pass" "$name" && break
+            warn "$PANEL_ERR"
+            (( ++tries < 3 )) || die "could not get an install command from $url"
+            [[ "$PANEL_ERR" == *"exists"* ]] && note "That name is taken: pick another."
+        done
+        ok "the panel added \"$name\""
+    fi
+    install_here || die "fix what it names (or use a freshly installed VPS), then run this again"
+    printf '\n%s%sDone.%s This server is connected: open %s and create its nodes.\n' "$B" "$G" "$N" "${url:-your panel}"
+}
 
 [[ -x "$STATE_DIR/node/bin/node" ]] && export PATH="$STATE_DIR/node/bin:$PATH"
 export NPM_CONFIG_UPDATE_NOTIFIER=false NPM_CONFIG_FUND=false   # no npm adverts in the middle of setup
-printf '%sroomkey setup%s — the panel on Cloudflare, then the command for your first server.\n' "$B" "$N"
+printf '%sroomkey setup%s — your panel on Cloudflare, and your servers.\n' "$B" "$N"
 [[ $DRY == 1 ]] && warn "dry run: nothing is sent to Cloudflare"
 # shellcheck source=/dev/null
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] && export CLOUDFLARE_ACCOUNT_ID
+
+if [[ -z "$MODE" ]]; then
+    note ""
+    note "What would you like to do?"
+    note "  1) Set up a new roomkey panel on your Cloudflare account"
+    note "  2) Connect this server to a roomkey panel you already have"
+    note "Every question shows its suggestion in [brackets]: press Enter to take it."
+    choice=""
+    while :; do
+        ask choice "Your choice, 1 or 2" 1
+        case "$choice" in 1) MODE="new"; break ;; 2) MODE="join"; break ;; esac
+        warn "type 1 or 2"
+    done
+fi
+if [[ "$MODE" == join ]]; then join_existing_panel; exit 0; fi
 
 # ── 1. tools ──────────────────────────────────────────────────────────────────
 step "Checking the tools on this computer"
@@ -248,7 +362,7 @@ fi
 ok "panel/node_modules ($(wr --version 2>/dev/null | tail -1 | tr -d ' ' || echo wrangler))"
 
 cf_api() {   # <path>: GET from the Cloudflare API with the token (kept out of the process list)
-    curl -sS --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") \
+    curl -sS ${CF_IPV4:+-4} --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") \
         "https://api.cloudflare.com/client/v4$1" 2>&1
 }
 cf_json() {   # <node expression over j, the parsed answer>: prints its lines; "!reason" when Cloudflare said no
@@ -267,14 +381,45 @@ node_reaches_cf() {   # can Node (what Wrangler runs on) use the token? prints t
           .then((j) => { if (!j.success) { console.log(JSON.stringify(j.errors)); process.exit(1) } })
           .catch((e) => { const c = e.cause ?? e; console.log(`${c.code ?? c.name ?? ""} ${c.message ?? e.message}`.trim()); process.exit(1) })'
 }
+zone_of() {   # <host>: "<zone id> <zone name>" of the zone holding it, as CF_DNS_TOKEN sees it; "!why" when not
+    local h=$1 r
+    while [[ "$h" == *.* ]]; do
+        r=$( { CLOUDFLARE_API_TOKEN="$CF_DNS_TOKEN" cf_api "/zones?name=$h" || true; } |
+            cf_json '(j.result ?? [])[0] ? `${j.result[0].id} ${j.result[0].name}` : ""')
+        if [[ -n "$r" ]]; then printf '%s' "$r"; return; fi
+        h=${h#*.}
+    done
+    printf '!this token sees no zone for %s' "$1"
+}
 cf_says() {   # <"!reason" from cf_json>
     if [[ "$1" == '!~'* ]]; then warn "${1#!~}"; else warn "Cloudflare says: ${1#!}"; fi
 }
+use_ipv4() {   # from here on, curl and Node (so Wrangler) reach Cloudflare over IPv4 only
+    export CF_IPV4=1 NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection ${NODE_OPTIONS:-}"
+}
 cf_token_ok() {   # checks CLOUDFLARE_API_TOKEN and fills $accounts ("<id> <name>" lines); on a problem, says why
-    local verify out
+    local verify out v4 where
     if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then warn "nothing was pasted"; return 1; fi
     # Cloudflare's own verdict on the token: active, expired, disabled, invalid…
     verify=$( { cf_api /user/tokens/verify || true; } | cf_json 'j.result?.status')
+    # a token limited to some IP addresses ("Client IP Address Filtering"): this server may have
+    # reached Cloudflare over IPv6 while the token lists its IPv4 address, so try that first
+    if [[ "$verify" == *"from location"* ]]; then
+        where=$(sed -n 's/.*from location: \([^ ]*\).*/\1/p' <<<"$verify")
+        if [[ -z "${CF_IPV4:-}" ]]; then
+            v4=$( { CF_IPV4=1 cf_api /user/tokens/verify || true; } | cf_json 'j.result?.status')
+            if [[ "$v4" != *"from location"* && "$v4" != *"could not reach"* ]]; then
+                use_ipv4
+                note "This token only works from some IP addresses, and this server's IPv6 address ($where) is"
+                note "not one of them; its IPv4 address is. roomkey talks to Cloudflare over IPv4 from here on."
+                cf_token_ok; return
+            fi
+        fi
+        warn "this token only works from some IP addresses, and this server ($where) is not one of them."
+        note "Fix: Cloudflare → API Tokens → the token → Edit → Client IP Address Filtering: add this"
+        note "server's addresses (or remove the filter). Or make a token without IP filtering."
+        return 1
+    fi
     if [[ "$verify" == active ]]; then
         accounts=$( { cf_api '/accounts?per_page=50' || true; } | cf_json 'j.result.map((a) => `${a.id} ${a.name}`).join("\n")')
         if [[ "$accounts" == '!'* ]]; then cf_says "$accounts"; return 1; fi
@@ -343,7 +488,7 @@ elif [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && wr whoami 2>&1 | grep -qi 'not auth
         export CLOUDFLARE_ACCOUNT_ID; save CLOUDFLARE_ACCOUNT_ID "$CLOUDFLARE_ACCOUNT_ID"
     else
         note "A browser window opens: sign in to Cloudflare and allow Wrangler."
-        wr login || die "Cloudflare sign-in did not finish"
+        ( cd "$PANEL" && npx --no-install wrangler login ) || die "Cloudflare sign-in did not finish"
         ok "signed in"
     fi
 else
@@ -354,6 +499,7 @@ fi
 step "A few questions (remembered for next time)"
 note "The panel gets two addresses on your Cloudflare domain: one for you (the admin page),"
 note "one for subscriptions and servers. The domain must already be on this Cloudflare account."
+note "Press Enter to take the suggestion in [brackets]."
 ask ADMIN_HOST "Admin page address" "${ADMIN_HOST:-admin.myroom.asia}"
 ask SUB_HOST "Subscription address (friends' clients and servers use it)" "${SUB_HOST:-sub.myroom.asia}"
 for h in "$ADMIN_HOST" "$SUB_HOST"; do
@@ -362,28 +508,56 @@ done
 [[ "$ADMIN_HOST" != "$SUB_HOST" ]] || die "the admin and subscription addresses must differ"
 save ADMIN_HOST "$ADMIN_HOST"; save SUB_HOST "$SUB_HOST"
 
-ADMIN_PASSWORD=""; again=""
-if [[ "${DEPLOYED:-}" == 1 ]]; then
-    note "Admin password: press Enter to keep the current one."
-fi
+# the admin's sign-in: a username, and a password (made for you when you press Enter)
+saved_pw=""; [[ -s "$LOGIN_FILE" ]] && saved_pw=$(sed -n 's/^password: //p' "$LOGIN_FILE")
 while :; do
-    ask_secret ADMIN_PASSWORD "Admin password (8+ characters)" 0
-    if [[ -z "$ADMIN_PASSWORD" && "${DEPLOYED:-}" == 1 ]]; then ok "keeping the current password"; break; fi
+    ask ADMIN_USER "Admin username" "${ADMIN_USER:-admin-$(rand_text 4 a-z0-9)}"
+    [[ "$ADMIN_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$ ]] && break
+    warn "3 to 32 letters, digits, dots, - or _"
+    ADMIN_USER=""
+done
+save ADMIN_USER "$ADMIN_USER"
+ADMIN_PASSWORD=""; again=""; PW_MADE=0
+if [[ -n "$saved_pw" || "${DEPLOYED:-}" == 1 ]]; then keep=keep; note "Admin password: press Enter to keep the current one, or type a new one (8+ characters)."
+else keep=random; note "Admin password: press Enter for a strong random one, or type your own (8+ characters)."; fi
+while :; do
+    ask_secret ADMIN_PASSWORD "Admin password [Enter = $keep]" 0
+    if [[ -z "$ADMIN_PASSWORD" ]]; then
+        if [[ -n "$saved_pw" ]]; then ADMIN_PASSWORD=$saved_pw; ok "keeping the current password"
+        elif [[ "${DEPLOYED:-}" == 1 ]]; then ok "keeping the current password"
+        else ADMIN_PASSWORD=$(rand_text 20); PW_MADE=1; ok "made a random 20-character password (shown at the end)"; fi
+        break
+    fi
     (( ${#ADMIN_PASSWORD} >= 8 )) || { warn "at least 8 characters"; continue; }
-    ask_secret again "Again"
+    ask_secret again "Again" 0
     [[ "$again" == "$ADMIN_PASSWORD" ]] && break
     warn "the two entries differ"
 done
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    ( umask 077; printf 'admin page: https://%s\nusername: %s\npassword: %s\n' "$ADMIN_HOST" "$ADMIN_USER" "$ADMIN_PASSWORD" >"$LOGIN_FILE" )
+fi
 
 CF_DNS_TOKEN=""
 note "Optional: a Cloudflare API token with Zone · DNS · Edit on the servers' domain lets the panel"
-note "keep each server's host name pointing at its IP. Press Enter to skip (you can add it later)."
-ask_secret CF_DNS_TOKEN "DNS token" 4
-if [[ -n "$CF_DNS_TOKEN" ]]; then
+note "keep each server's host name pointing at its IP. You can add it later."
+while :; do
+    ask_secret CF_DNS_TOKEN "DNS token [Enter = skip]" 4
+    if [[ -z "$CF_DNS_TOKEN" ]]; then note "skipped: no DNS token"; break; fi
     note "got $(token_hint "$CF_DNS_TOKEN")"
-    ask CF_ZONE_ID "That zone's ID (Cloudflare → the domain → Overview, right column)" "${CF_ZONE_ID:-}"
-    save CF_ZONE_ID "$CF_ZONE_ID"
-fi
+    if [[ $DRY == 1 ]]; then   # nothing goes to Cloudflare in a dry run: the zone is asked for
+        ask CF_ZONE_ID "That zone's ID (Cloudflare → the domain → Overview, right column)" "${CF_ZONE_ID:-}"
+        break
+    fi
+    zone=$(zone_of "$SUB_HOST")
+    if [[ -n "$zone" && "$zone" != '!'* ]]; then
+        CF_ZONE_ID=${zone%% *}; ok "zone ${zone#* } ($CF_ZONE_ID), found with that token"; break
+    fi
+    cf_says "${zone:-!no zone}"
+    note "The token needs Zone · DNS · Edit on the zone of $SUB_HOST. Paste another, or press Enter to skip."
+    CF_DNS_TOKEN=""
+done
+[[ -n "$CF_DNS_TOKEN" ]] && save CF_ZONE_ID "$CF_ZONE_ID"
 
 # ── 5. what servers download ──────────────────────────────────────────────────
 step "Building what servers download from the panel (PSM + psm-agent)"
@@ -403,7 +577,7 @@ else
         let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
           try { const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") } catch {} })' "$DB_NAME")
     if [[ -z "$DB_ID" ]]; then
-        wr d1 create "$DB_NAME" --location apac >/dev/null || die "could not create the D1 database '$DB_NAME'"
+        wr d1 create "$DB_NAME" --location apac --update-config=false >/dev/null || die "could not create the D1 database '$DB_NAME'"
         DB_ID=$(wr d1 list --json | node -e '
             let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
               const db = JSON.parse(s).find((d) => d.name === process.argv[1]); process.stdout.write(db ? db.uuid : "") })' "$DB_NAME")
@@ -445,9 +619,10 @@ fi
 # ── 7. deploy ─────────────────────────────────────────────────────────────────
 step "Deploying the panel to Cloudflare"
 secrets=$(mktemp); chmod 600 "$secrets"; trap 'rm -f "$secrets"' EXIT
-ADMIN_PASSWORD="$ADMIN_PASSWORD" CF_DNS_TOKEN="$CF_DNS_TOKEN" KEY="$( (( send_key )) && cat "$KEY_FILE" || true)" node -e '
+ADMIN_PASSWORD="$ADMIN_PASSWORD" ADMIN_USERNAME="$ADMIN_USER" CF_DNS_TOKEN="$CF_DNS_TOKEN" KEY="$( (( send_key )) && cat "$KEY_FILE" || true)" node -e '
   const e = process.env, s = {}
   if (e.ADMIN_PASSWORD) s.ADMIN_PASSWORD = e.ADMIN_PASSWORD
+  if (e.ADMIN_USERNAME) s.ADMIN_USERNAME = e.ADMIN_USERNAME
   if (e.KEY) s.TOKEN_KEY = e.KEY.trim()
   if (e.CF_DNS_TOKEN) s.CF_DNS_TOKEN = e.CF_DNS_TOKEN
   require("fs").writeFileSync(process.argv[1], JSON.stringify(s))
@@ -479,49 +654,56 @@ done
 (( up )) || die "$ADMIN_URL does not answer yet. Wait a few minutes and open it in a browser; the panel's 服务器 page makes install commands."
 ok "the panel answers at $ADMIN_URL"
 
-if [[ -z "$ADMIN_PASSWORD" ]]; then ask_secret ADMIN_PASSWORD "Admin password (to make the install command)"; fi
+summary() {   # the panel and how to sign in
+    printf '\n%s%sDone.%s Your roomkey panel is live.\n\n' "$B" "$G" "$N"
+    printf '  Admin page   %s%s%s\n' "$B" "$ADMIN_URL" "$N"
+    printf '  Username     %s\n' "$ADMIN_USER"
+    if (( PW_MADE )); then printf '  Password     %s%s%s   (made for you: save it in your password manager)\n' "$B" "$ADMIN_PASSWORD" "$N"
+    else printf '  Password     the one you chose\n'; fi
+    [[ -s "$LOGIN_FILE" ]] && printf '  Saved in     %s (only you can read it)\n' "$LOGIN_FILE"
+    printf '  Friends and servers use https://%s\n' "$SUB_HOST"
+    printf '  Back up      %s (the panel'"'"'s encryption key)\n' "$KEY_FILE"
+}
+
+if [[ -z "$ADMIN_PASSWORD" ]]; then ask_secret ADMIN_PASSWORD "Admin password (to make the install command)" 0; fi
+here=0; [[ "$(uname -s)" == Linux ]] && can_root && here=1
+default_name=${SERVER_NAME:-hk1}; (( here )) && default_name=${SERVER_NAME:-$(default_server_name)}
+tries=0
 while :; do
-    ask SERVER_NAME "A name for the server (letters, digits, -)" "${SERVER_NAME:-hk1}"
-    [[ "$SERVER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,30}$ ]] && break
-    warn "letters, digits and -, up to 31"
+    ask SERVER_NAME "A name for the server (letters, digits, -)" "$default_name"
+    [[ "$SERVER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,30}$ ]] || { warn "letters, digits and -, up to 31"; continue; }
+    panel_install_command "$ADMIN_URL" "$ADMIN_USER" "$ADMIN_PASSWORD" "$SERVER_NAME" && break
+    warn "$PANEL_ERR"
+    (( ++tries < 3 )) || die "the panel did not make an install command (above)"
+    [[ "$PANEL_ERR" == *"username and password"* ]] && ask_secret ADMIN_PASSWORD "Admin password" 0
 done
-jar=$(mktemp); trap 'rm -f "$jar"' EXIT
-login=$(node -e 'process.stdout.write(JSON.stringify({ password: process.argv[1] }))' "$ADMIN_PASSWORD")
-curl -s -c "$jar" -H 'content-type: application/json' --data-binary "$login" "$ADMIN_URL/api/login" -o /dev/null -w '%{http_code}' | grep -q 200 \
-    || die "the panel did not accept the password"
-resp=$(curl -s -b "$jar" -H 'content-type: application/json' --data-binary "{\"name\":\"$SERVER_NAME\"}" "$ADMIN_URL/api/servers")
-cmd=$(node -e 'try { process.stdout.write(JSON.parse(process.argv[1]).install_command || "") } catch {}' "$resp")
-rm -f "$jar"
-[[ "$cmd" == *"/api/agent/install/"* ]] || die "the panel did not make an install command: $resp"
 save SERVER_NAME "$SERVER_NAME"
 
 # on a Linux server: install roomkey right here too
-if [[ "$(uname -s)" == Linux ]] && can_root; then
+if (( here )); then
     note ""
-    note "This computer is a Linux server: it can become \"$SERVER_NAME\" now. roomkey first checks it and"
-    note "refuses (changing nothing) if it already runs other proxies (3x-ui, Xray, Marzban…) or nginx."
+    note "This computer is a Linux server: it can become \"$SERVER_NAME\" now."
     if yes_no "Install roomkey on this server now?" y; then
-        if $SUDO sh -c "$cmd"; then
-            ok "this server is \"$SERVER_NAME\" in the panel: open $ADMIN_URL and create its nodes"
+        if install_here; then
+            summary
+            printf '\n  This server is "%s" in the panel: open the admin page and create its nodes.\n' "$SERVER_NAME"
             exit 0
         fi
-        warn "the install above did not finish; the server was left as the check found it"
         note "Fix what it names (or use a freshly installed VPS) and run the command below there."
     fi
 fi
 
+summary
 cat <<EOF
-
-${B}${G}Done.${N} The panel: ${B}$ADMIN_URL${N}
 
 ${B}Install command for "$SERVER_NAME"${N} — run it as root on the server (works once, for 24 hours):
 
-  $cmd
+  $INSTALL_CMD
 
 ${Y}Before you run it:${N}
   • Use a ${B}freshly installed${N} VPS (Debian 12/13, Ubuntu 22.04/24.04 or Alpine). roomkey refuses a
     server that already runs other proxies (3x-ui, Xray, Marzban…) or nginx, and changes nothing there.
   • Open ports 80 and 443 in the provider's firewall.
   • Then, in the panel: create nodes on the server and users for your friends.
-More servers: the panel's 服务器 page → 添加服务器 (or run ./setup.sh again).
+More servers: the panel's 服务器 page → 添加服务器, or on that server run this setup and choose 2.
 EOF

@@ -1,4 +1,6 @@
-// Admin sign-in: one password. It comes from the ADMIN_PASSWORD secret (the
+// Admin sign-in: a username (the ADMIN_USERNAME secret; deploys made before it
+// existed have none, and sign in with the password alone) and one password.
+// The password comes from the ADMIN_PASSWORD secret (the
 // Deploy to Cloudflare form asks for it), and the first time the panel sees it
 // a salted PBKDF2 record is kept in `settings`, so a deploy that loses the
 // secret no longer locks everyone out. That happens: `wrangler deploy` keeps
@@ -133,6 +135,17 @@ export async function revokeSessions(db: D1Database): Promise<void> {
   await db.prepare(`INSERT INTO settings (key, value) VALUES (?, '1')
     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`).bind(EPOCH_SETTING).run()
   await currentEpoch(db, true)
+}
+
+/** Whether sign-in asks for a username: only when ADMIN_USERNAME is set. */
+export const usernameRequired = (env: Env) => (env.ADMIN_USERNAME ?? '').trim().length > 0
+
+/** The username, ignoring case and surrounding spaces; anything goes when none is set. */
+export async function usernameMatches(env: Env, given: string): Promise<boolean> {
+  const want = (env.ADMIN_USERNAME ?? '').trim().toLowerCase()
+  if (!want) return true
+  const [a, b] = await Promise.all([given.trim().toLowerCase(), want].map((s) => crypto.subtle.digest('SHA-256', enc.encode(s))))
+  return crypto.subtle.timingSafeEqual(a, b)
 }
 
 export async function passwordMatches(env: Env, given: string): Promise<boolean> {

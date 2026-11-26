@@ -7,6 +7,7 @@ import { decrypt, encrypt } from './crypto'
 import { ensureSchema, storedTokenKey, UpstreamDatabase } from './schema'
 import {
   adminConfigured, clearFailures, clearedCookie, ipKey, passwordIgnored, passwordMatches, recordFailure, revokeSessions,
+  usernameMatches, usernameRequired,
   sessionCookie, syncAdminPassword, tooManyFailures, validSession,
 } from './auth'
 import { buildSubscription, displayName, pickFormat, renamed, type SubNode } from './subscription'
@@ -33,6 +34,8 @@ export type Env = {
   ASSETS: Fetcher
   /** the admin password (secret; the Deploy to Cloudflare form asks for it) */
   ADMIN_PASSWORD?: string
+  /** the admin username (secret, optional): when set, sign-in asks for it too */
+  ADMIN_USERNAME?: string
   /** the key for D1 (secret, optional): filled in from D1's own when not set */
   TOKEN_KEY: string
   /** the panel's public address, used in the install command (default: the request's origin) */
@@ -425,17 +428,21 @@ const isHttps = (url: string) => new URL(url).protocol === 'https:'
 
 app.get('/api/session', async (c) =>
   c.json({ configured: adminConfigured(c.env), authenticated: await validSession(c.env, c.req.header('Cookie')),
-    version: PANEL_VERSION, password_ignored: passwordIgnored(c.env) }))
+    version: PANEL_VERSION, password_ignored: passwordIgnored(c.env), username_required: usernameRequired(c.env) }))
 
 app.post('/api/login', async (c) => {
   if (!adminConfigured(c.env)) return c.json(fail('not_configured', 'set the ADMIN_PASSWORD secret (8+ characters)'), 503)
   const ip = ipKey(c.req.header('CF-Connecting-IP') ?? 'unknown')
   if (await tooManyFailures(c.env.DB, ip)) return c.json(fail('too_many', 'too many failed sign-ins; try again in 15 minutes'), 429)
-  const body = await c.req.json<{ password?: unknown }>().catch(() => null)
-  if (!(await passwordMatches(c.env, typeof body?.password === 'string' ? body.password : ''))) {
+  const body = await c.req.json<{ username?: unknown; password?: unknown }>().catch(() => null)
+  const text = (v: unknown) => (typeof v === 'string' ? v : '')
+  // both checked every time, so a wrong username takes as long as a wrong password
+  const [userOk, passOk] = await Promise.all([
+    usernameMatches(c.env, text(body?.username)), passwordMatches(c.env, text(body?.password))])
+  if (!userOk || !passOk) {
     await recordFailure(c.env.DB, ip)
     await audit(c.env, 'login.failed', ip, '', 'anonymous')
-    return c.json(fail('bad_password', 'wrong password'), 401)
+    return c.json(fail('bad_password', usernameRequired(c.env) ? 'wrong username or password' : 'wrong password'), 401)
   }
   await clearFailures(c.env.DB, ip)
   await audit(c.env, 'login', ip)

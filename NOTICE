@@ -1,0 +1,31 @@
+roomkey
+Copyright (C) 2026 The1UNeed
+
+roomkey is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License, version 3 (see LICENSE).
+It comes with no warranty.
+
+roomkey is its own panel, with its own name, design and features. It is built
+on the work of the projects below; their code is used under their licenses,
+and their authors keep their copyright.
+
+  psm-panel    https://github.com/jinqians/psm-panel             AGPL-3.0
+               Copyright (C) jinqians and contributors
+               The starting point of panel/: the panel on Cloudflare Workers + D1.
+
+  proxy-stack  https://github.com/jinqians/proxy-stack           AGPL-3.0
+  (PSM)        Copyright (C) jinqians and contributors
+               The starting point of stack/: installs and runs the proxy cores on
+               each server, and psm-agent, which talks to the panel.
+
+  3x-ui        https://github.com/MHSanaei/3x-ui                 GPL-3.0
+               Copyright (C) MHSanaei and contributors
+               A reference for per-user features (traffic limits, expiry, IP
+               limits, client statistics). Kept in 3x-ui/ under its own license.
+
+The software roomkey installs or builds on (Xray, sing-box, mihomo, Hono, Vue
+and others) keeps its own license.
+
+What the AGPL asks of anyone who runs a changed roomkey for other people (for
+example, friends who fetch subscriptions from it): offer those people the
+source of that version. The footer of every panel page links to it.
