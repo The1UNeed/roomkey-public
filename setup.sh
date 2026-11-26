@@ -69,7 +69,8 @@ ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 note() { printf '  %s\n' "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '\n%s✗ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
-TTY_INIT=""; [[ -t 0 ]] && TTY_INIT=$(stty -g 2>/dev/null || true)
+# typing shows (a program stopped mid-question, Wrangler's say, can leave a terminal without echo)
+TTY_INIT=""; [[ -t 0 ]] && { stty echo icanon 2>/dev/null || true; TTY_INIT=$(stty -g 2>/dev/null || true); }
 tty_back() {   # the terminal as it was, and no leftover keypresses (they would answer the next question)
     [[ -n "$TTY_INIT" ]] || return 0
     stty "$TTY_INIT" 2>/dev/null || true
@@ -78,7 +79,9 @@ tty_back() {   # the terminal as it was, and no leftover keypresses (they would 
 }
 ask() {   # <var> <question> [default]: Enter takes the default
     local v; tty_back
-    if [[ -n "${3:-}" ]]; then read -r -p "  $2 [$3]: " v; v="${v:-$3}"; else read -r -p "  $2: " v; fi
+    if [[ -n "${3:-}" ]]; then read -r -p "  $2 [$3]: " v; else read -r -p "  $2: " v; fi
+    v="${v%$'\r'}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"   # no stray CR or spaces
+    [[ -z "$v" ]] && v="${3:-}"
     printf -v "$1" '%s' "$v"
 }
 ask_secret() {   # <var> <question> [letters to show]: typing shows the first few letters, then *
@@ -409,6 +412,15 @@ zone_of() {   # <host>: "<zone id> <zone name>" of the zone holding it, as CF_DN
     done
     printf '!this token sees no zone for %s' "$1"
 }
+cf_missing() {   # <admin host>: what the token lacks for a deploy, one line each (nothing when all is there)
+    local r
+    r=$( { cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" || true; } | cf_json '"ok"')
+    [[ "$r" == ok || "$r" == '!~'* ]] || echo "Account · Workers Scripts · Edit"
+    r=$( { cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?per_page=5" || true; } | cf_json '"ok"')
+    [[ "$r" == ok || "$r" == '!~'* ]] || echo "Account · D1 · Edit"
+    r=$(CF_DNS_TOKEN="$CLOUDFLARE_API_TOKEN" zone_of "$1")
+    [[ -n "$r" && "$r" != '!'* ]] || echo "Zone · Workers Routes · Edit and Zone · DNS · Edit, with the zone of $1 under Zone Resources"
+}
 cf_says() {   # <"!reason" from cf_json>
     if [[ "$1" == '!~'* ]]; then warn "${1#!~}"; else warn "Cloudflare says: ${1#!}"; fi
 }
@@ -529,6 +541,20 @@ for h in "$ADMIN_HOST" "$SUB_HOST"; do
 done
 [[ "$ADMIN_HOST" != "$SUB_HOST" ]] || die "the admin and subscription addresses must differ"
 save ADMIN_HOST "$ADMIN_HOST"; save SUB_HOST "$SUB_HOST"
+
+# everything the deploy needs, checked now rather than halfway through it
+if [[ $DRY == 0 && -n "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+    while lacking=$(cf_missing "$ADMIN_HOST"); [[ -n "$lacking" ]]; do
+        warn "your Cloudflare token cannot do everything the panel needs. It is missing:"
+        while IFS= read -r m; do note "    • $m"; done <<<"$lacking"
+        note "Add them to the token (its value stays the same, nothing to paste again):"
+        note "  a token starting cfat_: Cloudflare → Manage Account → Account API Tokens → the token → Edit"
+        note "  a token starting cfut_: Cloudflare → My Profile → API Tokens → the token → Edit"
+        note "Then Continue to summary → Update token, and come back here."
+        yes_no "Check again?" y || die "the deploy needs those permissions"
+    done
+    ok "the token has every permission the deploy needs"
+fi
 
 # the admin's sign-in: a username, and a password (made for you when you press Enter)
 saved_pw=""; [[ -s "$LOGIN_FILE" ]] && saved_pw=$(sed -n 's/^password: //p' "$LOGIN_FILE")
