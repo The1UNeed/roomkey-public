@@ -182,6 +182,14 @@ _agent_join() {
 # named in this very file: a shell that sourced the old copy would faithfully
 # reinstall the old agent. Hence the re-exec after the pull, so that the
 # download below reads the new value.
+# psm-agent is already this version, but PSM was just updated: restart it all
+# the same. It looks PSM's version and capabilities up once an hour, so until
+# then the panel would show the old PSM (and miss what the new one can do).
+_agent_restart_same() {
+    log_ok "psm-agent is already ${PSM_AGENT_VERSION}; restarting it to pick up the updated PSM."
+    svc_restart "$PSM_AGENT_SERVICE" >/dev/null 2>&1 || true
+}
+
 _agent_upgrade() {
     local pull=1 have
     while (( $# )); do
@@ -207,8 +215,7 @@ _agent_upgrade() {
     _agent_guard || return 1
     have=$("$PSM_AGENT_BIN" version 2>/dev/null || true)
     if [[ "$have" == "$PSM_AGENT_VERSION" ]]; then
-        log_ok "psm-agent is already ${PSM_AGENT_VERSION}."
-        svc_is_active "$PSM_AGENT_SERVICE" || svc_restart "$PSM_AGENT_SERVICE" >/dev/null 2>&1 || true
+        _agent_restart_same
         return 0
     fi
     log_step "psm-agent ${have:-not installed} → ${PSM_AGENT_VERSION}"

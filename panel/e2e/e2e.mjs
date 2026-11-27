@@ -556,7 +556,7 @@ inbox.length = 0
 const cron = async () => { await fetch(`${BASE}/__scheduled?cron=*/5+*+*+*+*`); await new Promise((res) => setTimeout(res, 900)) }
 await sync()   // hk1 runs psm-agent 0.14.0 again: older than this panel's 0.15.0
 let up = (await admin('GET', '/api/updates')).data
-ok(up.panel.version === '0.12.1' && up.panel.latest?.version === '0.13.0' && up.panel.newer && up.panel.missing.length === 0 && !up.auto,
+ok(up.panel.version === '0.12.2' && up.panel.latest?.version === '0.13.0' && up.panel.newer && up.panel.missing.length === 0 && !up.auto,
   'the panel sees release 0.13.0, can update itself, and does not until asked', JSON.stringify(up.panel))
 ok(up.servers.some((s) => s.name === 'hk1' && s.online), 'hk1 is listed as out of date (psm-agent 0.14.0)', JSON.stringify(up.servers))
 for (const [w, why] of [[{ start: 3, end: 3, tz: 'UTC' }, 'the same hour twice'], [{ start: 3, end: 25, tz: 'UTC' }, 'hour 25'], [{ start: 3, end: 5, tz: 'Mars/Base' }, 'an unknown zone']])

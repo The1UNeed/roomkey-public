@@ -19,7 +19,7 @@ import { applyLeaveUsage, cron as roomkeyCron, onSync as roomkeySync, reconcileU
 // not exported: every export of a Worker's main module is taken for an entrypoint
 // Shown in 系统设置 as 面板版本; bump it whenever the panel gains something, so
 // that it answers "did my deploy take effect?" — the only marker a user has.
-const PANEL_VERSION = '0.12.1'
+const PANEL_VERSION = '0.12.2'
 /** A result the panel could not record (its node is failed; whether it ran on the server is unknown). */
 const UNRECORDED = '面板没能记录这个结果：'
 /** A create the server refused because the same node (or standalone server) is already there, not the panel's: never removed by the panel. */
