@@ -94,7 +94,7 @@ function saved(u: PanelUser) {
   if (detail.value?.id === u.id || !detail.value) detail.value = u
 }
 const accessText = (u: PanelUser) => u.access.some((a) => a.kind === 'all') ? '全部节点'
-  : u.access.filter((a) => a.kind === 'label').map((a) => a.value).join('、') || `${u.access.length} 个指定节点`
+  : u.access.some((a) => a.kind === 'label') ? `标签 ${u.access.filter((a) => a.kind === 'label').map((a) => a.value).join('、')}` : `${u.access.length} 个指定节点`
 </script>
 
 <template>
@@ -109,11 +109,14 @@ const accessText = (u: PanelUser) => u.access.some((a) => a.kind === 'all') ? '�
     <div class="card stat"><span class="l">在线</span><span class="n">{{ counts.online }}</span><span class="s">最近 15 分钟有连接</span></div>
   </div>
 
-  <div class="card table-wrap">
-    <div class="table-tools">
-      <input v-model="query" class="input small" placeholder="搜索用户名或备注" style="max-width: 240px" data-test="user-search">
+  <div class="card">
+    <div class="toolbar">
+      <input v-model="query" class="input search" placeholder="搜索用户名或备注" data-test="user-search">
+      <span class="grow" />
+      <span class="muted">{{ query.trim() ? `${shown.length} / ${users.length}` : users.length }} 个用户</span>
     </div>
-    <table>
+    <div class="table-wrap">
+    <table class="cards">
       <thead><tr><th>用户</th><th>状态</th><th>本周期流量</th><th>到期</th><th>节点</th><th>设备</th><th class="actions">操作</th></tr></thead>
       <tbody>
         <tr v-for="u in shown" :key="u.id" class="clickable" :data-test="`user-${u.name}`" @click="open(u)">
@@ -122,24 +125,29 @@ const accessText = (u: PanelUser) => u.access.some((a) => a.kind === 'all') ? '�
             <span class="status" :class="USER_STATE_CLASS[u.state]"><span class="dot" />{{ u.state_label }}</span>
             <div v-if="u.blocked_reason && u.state === 'devices'" class="muted small">{{ u.blocked_reason }}</div>
           </td>
-          <td style="min-width: 150px">
+          <td style="min-width: 150px" data-label="本周期流量">
             {{ formatBytes(u.used_total_bytes) }}<span v-if="u.quota_total_bytes" class="muted"> / {{ formatBytes(u.quota_total_bytes) }}</span>
             <div v-if="u.quota_total_bytes" class="meter" style="margin-top: 3px"><span :class="{ over: pct(u) >= 80, full: pct(u) >= 100 }" :style="{ width: `${pct(u)}%` }" /></div>
             <div v-if="u.period_end" class="muted small">{{ u.period_end }} 重置</div>
           </td>
-          <td>
+          <td data-label="到期">
             {{ expiryText(u) }}
             <div v-if="daysLeft(u) !== null && daysLeft(u)! >= 0 && daysLeft(u)! <= 7" class="small" style="color: var(--warn)">还剩 {{ daysLeft(u) }} 天</div>
           </td>
-          <td class="small">{{ accessText(u) }}</td>
-          <td class="small">{{ u.online }}{{ u.device_limit ? ` / ${u.device_limit}` : '' }}</td>
+          <td class="small" data-label="节点">{{ accessText(u) }}</td>
+          <td class="small" data-label="设备">{{ u.online }}{{ u.device_limit ? ` / ${u.device_limit}` : '' }}</td>
           <td class="actions" @click.stop>
-            <button class="btn small ghost" :data-test="`user-edit-${u.name}`" @click="dialog = { user: u }"><Icon name="edit" />编辑</button>
-            <button class="btn small ghost" @click="toggle(u)">{{ u.enabled ? '停用' : '启用' }}</button>
+            <span class="row-actions">
+              <button class="btn small ghost" :data-test="`user-link-${u.name}`" @click="open(u)"><Icon name="link" />订阅链接</button>
+              <button class="btn small ghost" :data-test="`user-edit-${u.name}`" @click="dialog = { user: u }"><Icon name="edit" />编辑</button>
+              <button class="btn small ghost" @click="toggle(u)"><Icon :name="u.enabled ? 'pause' : 'play'" />{{ u.enabled ? '停用' : '启用' }}</button>
+            </span>
           </td>
         </tr>
       </tbody>
     </table>
+    </div>
+    <div v-if="loaded && users.length && !shown.length" class="empty" data-test="user-search-empty">没有符合「{{ query.trim() }}」的用户。</div>
     <div v-if="loaded && !users.length" class="empty">
       <div class="big">👤</div><p>还没有用户。新建一个，把订阅链接发给对方就能用。</p>
       <button class="btn primary" @click="dialog = { user: null }"><Icon name="plus" />新建用户</button>
@@ -203,7 +211,6 @@ const accessText = (u: PanelUser) => u.access.some((a) => a.kind === 'all') ? '�
 </template>
 
 <style scoped>
-.table-tools { padding: 12px 14px 0 }
 tr.clickable { cursor: pointer }
 tr.clickable:hover td { background: var(--hover) }
 table.compact td, table.compact th { padding: 6px 8px }

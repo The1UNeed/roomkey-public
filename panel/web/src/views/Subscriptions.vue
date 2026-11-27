@@ -1,16 +1,24 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { api, ApiError, ago, errorText, localTime, type Subscription, type Template, type Templates } from '../api'
+import { api, ApiError, ago, errorText, localTime, type PanelNode, type Subscription, type Template, type Templates } from '../api'
 import { confirmAction, toast } from '../ui'
 import SecretText from '../components/SecretText.vue'
 import Modal from '../components/Modal.vue'
 import Icon from '../components/Icon.vue'
+import ComboBox, { type ComboOption } from '../components/ComboBox.vue'
 
 const subs = ref<Subscription[]>([])
 const tpl = ref<Templates | null>(null)
 const name = ref('')
 const labels = ref<string[]>([])
 const labelDraft = ref('')
+// the labels the nodes carry, picked from a list (typing one stays possible)
+const nodeLabels = ref<string[]>([])
+const labelOptions = computed<ComboOption[]>(() => {
+  const n = new Map<string, number>()
+  for (const l of nodeLabels.value) n.set(l, (n.get(l) ?? 0) + 1)
+  return [...n].filter(([l]) => !labels.value.includes(l)).sort(([a], [b]) => a.localeCompare(b)).map(([l, c]) => ({ value: l, note: `${c} 个节点` }))
+})
 const error = ref('')
 
 const formats = [
@@ -48,10 +56,10 @@ async function load() {
     loaded.value = true
   }
 }
-onMounted(load)
+onMounted(() => { void load(); api<PanelNode[]>('/api/nodes').then((ns) => { nodeLabels.value = ns.flatMap((x) => x.labels) }).catch(() => {}) })
 
-function addLabel() {
-  const l = labelDraft.value.trim()
+function addLabel(picked?: string) {
+  const l = (typeof picked === 'string' ? picked : labelDraft.value).trim()
   if (l && !labels.value.includes(l)) labels.value.push(l)
   labelDraft.value = ''
 }
@@ -143,7 +151,7 @@ async function removeTemplate(t: Template) {
     <div><h1>共享订阅</h1><p>一个订阅地址给出选中的节点，按客户端自动选格式。地址本身就是密钥：只发给要用的人，泄露了就重置。</p></div>
   </div>
   <div class="notice warn section" data-test="shared-sub-warning">
-    <b>给朋友用请到「用户」页发他们自己的链接。</b>这里的共享订阅用的是节点本身（管理员）的密钥：没有流量限额、到期时间和设备限制，也没法单独停掉某个人。只留给你自己的设备用。
+    <b>给朋友用请到<a href="#/users">「用户」页</a>发他们自己的链接。</b>这里的共享订阅用的是节点本身（管理员）的密钥：没有流量限额、到期时间和设备限制，也没法单独停掉某个人。只留给你自己的设备用。
   </div>
   <form class="card card-pad section" @submit.prevent="create">
     <div class="row2">
@@ -153,10 +161,10 @@ async function removeTemplate(t: Template) {
       </div>
       <div class="field">
         <label>只包含带这些标签的节点（留空为全部）</label>
-        <div class="chips">
-          <span v-for="l in labels" :key="l" class="chip">{{ l }}<button type="button" @click="labels = labels.filter((x) => x !== l)">×</button></span>
-          <input v-model="labelDraft" placeholder="输入后回车添加" @keydown.enter.prevent="addLabel">
+        <div v-if="labels.length" class="chips" style="margin-bottom: 6px">
+          <span v-for="l in labels" :key="l" class="chip">{{ l }}<button type="button" :aria-label="`去掉 ${l}`" @click="labels = labels.filter((x) => x !== l)">×</button></span>
         </div>
+        <ComboBox v-model="labelDraft" :options="labelOptions" placeholder="选择节点标签，或输入后回车" test="sub-label" @pick="addLabel" @keydown.enter.prevent="addLabel()" />
       </div>
     </div>
     <div v-if="error" class="notice err">{{ error }}</div>
@@ -199,12 +207,12 @@ async function removeTemplate(t: Template) {
     <button class="btn primary" type="button" data-test="tpl-new" @click="startNew()"><Icon name="plus" />新建模板</button>
   </div>
   <div class="card table-wrap">
-    <table>
+    <table class="cards">
       <thead><tr><th>名称</th><th>格式</th><th>更新时间</th><th class="actions">操作</th></tr></thead>
       <tbody>
         <tr v-for="t in tpl?.custom ?? []" :key="t.id" :data-test="`tpl-${t.name}`">
-          <td><b>{{ t.name }}</b></td><td>{{ tpl?.formats[t.format] ?? t.format }}</td><td>{{ localTime(t.updated_at ?? t.created_at) }}</td>
-          <td class="actions"><button class="btn small ghost" @click="startEdit(t)"><Icon name="edit" />编辑</button> <button class="btn small ghost danger" @click="removeTemplate(t)"><Icon name="trash" />删除</button></td>
+          <td><b>{{ t.name }}</b></td><td data-label="格式">{{ tpl?.formats[t.format] ?? t.format }}</td><td data-label="更新于">{{ localTime(t.updated_at ?? t.created_at) }}</td>
+          <td class="actions"><span class="row-actions"><button class="btn small ghost" @click="startEdit(t)"><Icon name="edit" />编辑</button> <button class="btn small ghost danger" @click="removeTemplate(t)"><Icon name="trash" />删除</button></span></td>
         </tr>
       </tbody>
     </table>

@@ -1078,32 +1078,62 @@ _psm_guard_norm() {   # <core> <config>
 }
 
 psm_fallback_violations() {
-    local core="$1" cfg="${2:-}" norm rc=0
+    local core="$1" cfg="${2:-}" norm rc=0 borrowed
     [[ -n "$cfg" ]] || cfg=$(_psm_core_cfg "$core")
     [[ -f "$cfg" ]] || return 0
+    borrowed=$(psm_borrowed_sites "$core")
     case "$core" in
         xray|sing-box)
             norm=$(_psm_guard_norm "$core" "$cfg") || { echo "$cfg cannot be read (or spells one key two ways)"; return 0; }
-            _psm_fallback_violations_read "$core" "$norm" || rc=$?
+            _psm_fallback_violations_read "$core" "$norm" "$borrowed" || rc=$?
             rm -f "$norm"; return "$rc" ;;
-        *) _psm_fallback_violations_read "$core" "$cfg" ;;
+        *) _psm_fallback_violations_read "$core" "$cfg" "$borrowed" ;;
     esac
 }
-_psm_fallback_violations_read() {   # <core> <config, normalised for xray / sing-box>
-    local core="$1" cfg="$2" out
+
+# psm_borrowed_sites <core>: {"<tag>": "<domain>:443"} for the core's REALITY
+# nodes whose owner chose a borrowed site on purpose (borrowed_site: true in
+# the node store: the panel's 借用其他网站, or `psm node add … --input` with
+# it). Their fallback may lead to that one site and nowhere else: a domain on
+# port 443, the node's own SNI. Anyone without the key is passed on to that
+# site, which is the owner's informed choice (a CDN-shared site also gets the
+# fallback speed limit, node_cli). Every other off-server fallback is refused.
+psm_borrowed_sites() {
+    local core="$1" dir f out
+    case "$core" in xray) dir=xray ;; sing-box) dir=singbox ;; mihomo) dir=mihomo ;; *) echo '{}'; return 0 ;; esac
+    # (one answer whatever the caller's shell options: a store that cannot be
+    # read lends nothing, and its nodes are then refused by the guard)
+    out=$(for f in "$CFG_DIR/$dir/reality.json" "$CFG_DIR/$dir/xhttp.json"; do
+        if [[ -f "$f" && ! -L "$f" ]]; then cat "$f" || true; fi
+    done | jq -sc '[.[] | arrays | .[] | objects | select(.borrowed_site == true and .own_site != true)
+        | (.server_name // "" | tostring | ascii_downcase) as $sn
+        | select($sn | test("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"))
+        | (.dest // ($sn + ":443") | tostring | ascii_downcase) as $d
+        | select($d == ($sn + ":443"))
+        | {key: (.tag | tostring), value: $d}] | from_entries' 2>/dev/null) || out=""
+    [[ "$out" == "{"*"}" ]] || out='{}'
+    printf '%s\n' "$out"
+}
+_psm_fallback_violations_read() {   # <core> <config, normalised for xray / sing-box> [borrowed sites]
+    local core="$1" cfg="$2" b="${3:-}" out
+    [[ -n "$b" ]] || b='{}'
     case "$core" in
-        xray) out=$(jq -r --arg own "$PSM_OWN_SITE" "$PSM_JQ_ADDR"'
+        xray) out=$(jq -r --arg own "$PSM_OWN_SITE" --argjson b "$b" "$PSM_JQ_ADDR"'
             # VLESS / Trojan fallbacks: a port, a loopback address or a socket on this server only
             (.inbounds[]? | (.settings.fallbacks // [])[]? | (.dest // "") | tostring
              | select((test("^[0-9]+$") or test("^[/@]") or (test(":[0-9]+$") and loaddr)) | not)
              | "fallback to \(.)"),
-            (.inbounds[]? | select((.streamSettings.security // "") == "reality") | .streamSettings.realitySettings as $r
+            # REALITY: this server'"'"'s own site, or the one site its owner borrowed
+            (.inbounds[]? | select((.streamSettings.security // "") == "reality")
+            | ($b[(.tag // "") | tostring] // "") as $lent
+            | .streamSettings.realitySettings as $r
             | [($r | has("dest")), ($r | has("target"))] as [$hd, $ht]
-            | if ($hd | not) and ($ht | not) then "REALITY without a target"
-              elif ($hd and ($r.dest | tostring) != $own) then "REALITY dest \($r.dest)"
-              elif ($ht and ($r.target | tostring) != $own) then "REALITY target \($r.target)"
+            | def ok($v): ($v | tostring) == $own or ($lent != "" and ($v | tostring | ascii_downcase) == $lent);
+              if ($hd | not) and ($ht | not) then "REALITY without a target"
+              elif ($hd and (ok($r.dest) | not)) then "REALITY dest \($r.dest)"
+              elif ($ht and (ok($r.target) | not)) then "REALITY target \($r.target)"
               else empty end)' "$cfg" 2>/dev/null) || { echo "$cfg cannot be read"; return 0; } ;;
-        sing-box) out=$(jq -r "$PSM_JQ_ADDR"'def offsite_masq: if type == "object" then (if (.type // "") == "proxy" then (.url // "" | tostring) else "" end) else tostring end
+        sing-box) out=$(jq -r --argjson b "$b" "$PSM_JQ_ADDR"'def offsite_masq: if type == "object" then (if (.type // "") == "proxy" then (.url // "" | tostring) else "" end) else tostring end
                 | test("^https?://") and (test("^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?(/|$)") | not);
             # Trojan fallbacks (default and per ALPN), each on its own: an IP
             # literal on loopback, nothing else (a hostname proves nothing)
@@ -1111,17 +1141,20 @@ _psm_fallback_violations_read() {   # <core> <config, normalised for xray / sing
              | select(loip | not) | "Trojan fallback to \(.)"),
             (.inbounds[]?
             | if .type == "hysteria2" and has("masquerade") and (.masquerade | offsite_masq) then "Hysteria2 masquerade \(.masquerade | tostring)"
-              elif .tls.reality.enabled == true then .tls.reality.handshake as $h
-                | select(($h.server // "") != "127.0.0.1" or ($h.server_port // 0) != 8443) | "REALITY handshake \($h.server):\($h.server_port)"
+              elif .tls.reality.enabled == true then ($b[(.tag // "") | tostring] // "") as $lent | .tls.reality.handshake as $h
+                | select(($h.server // "") != "127.0.0.1" or ($h.server_port // 0) != 8443)
+                | select($lent == "" or ("\($h.server // ""):\($h.server_port // 0)" | ascii_downcase) != $lent)
+                | "REALITY handshake \($h.server):\($h.server_port)"
               elif .type == "shadowtls" then (.handshake // {}) as $h
                 | select(($h.server // "") != "127.0.0.1" or ($h.server_port // 0) != 8443 or (.handshake_for_server_name // {} | length) > 0)
                 | "ShadowTLS handshake \($h.server):\($h.server_port)"
               else empty end)' "$cfg" 2>/dev/null) || { echo "$cfg cannot be read"; return 0; } ;;
-        mihomo) out=$(jq -r --arg own "$PSM_OWN_SITE" 'def offsite_masq: if type == "object" then (if (.type // "") == "proxy" then (.url // "" | tostring) else "" end) else tostring end
+        mihomo) out=$(jq -r --arg own "$PSM_OWN_SITE" --argjson b "$b" 'def offsite_masq: if type == "object" then (if (.type // "") == "proxy" then (.url // "" | tostring) else "" end) else tostring end
                 | test("^https?://") and (test("^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?(/|$)") | not);
             .listeners[]?
             | (if .type == "hysteria2" and has("masquerade") and (.masquerade | offsite_masq) then "Hysteria2 masquerade \(.masquerade | tostring)" else empty end),
-              (if has("reality-config") then (.["reality-config"].dest // "" | tostring) | select(. != $own) | "REALITY dest \(.)" else empty end),
+              (if has("reality-config") then ($b[(.name // "") | tostring] // "") as $lent | (.["reality-config"].dest // "" | tostring)
+                | select(. != $own and ($lent == "" or ascii_downcase != $lent)) | "REALITY dest \(.)" else empty end),
               (if (.["shadow-tls"].enable // false) then (.["shadow-tls"].handshake.dest // "" | tostring) | select(. != $own) | "ShadowTLS handshake \(.)" else empty end)' \
             "$cfg" 2>/dev/null) || { echo "$cfg cannot be read"; return 0; } ;;
     esac
@@ -1261,7 +1294,7 @@ psm_reality_guard() {
     fi
     bad=$(psm_fallback_violations "$core" "$cfg")
     [[ -z "$bad" ]] && return 0
-    log_error "${core}: a camouflage fallback leads off this server ($(tr '\n' ';' <<<"$bad")): anyone without the key would be passed on to it, an open relay. Only PSM's own site (${PSM_OWN_SITE}, REALITY own_site) is allowed; ${core} was not started"
+    log_error "${core}: a camouflage fallback leads off this server ($(tr '\n' ';' <<<"$bad")): anyone without the key would be passed on to it, an open relay. Only PSM's own site (${PSM_OWN_SITE}, REALITY own_site), or a site borrowed on purpose (borrowed_site: a domain on 443, the node's SNI), is allowed; ${core} was not started"
     return 1
 }
 
@@ -1727,6 +1760,7 @@ reality_validate_dest() {
     REALITY_DEST_REASON=""
     REALITY_DEST_RTT_MS=""
     REALITY_DEST_WARN=""
+    REALITY_DEST_ALPN=""
 
     # Parse "host:port" or "[ipv6]:port"
     local host port
@@ -1797,6 +1831,7 @@ reality_validate_dest() {
         fi
     fi
 
+    REALITY_DEST_ALPN=$(sed -n 's/^ALPN protocol: *//p' "$out" | head -n1)
     rm -f "$out"
     if [[ -n "$reason" ]]; then
         REALITY_DEST_REASON="$reason"; return 1
@@ -1919,3 +1954,50 @@ with_backup() {
 # ── i18n 初始化（放在文件末尾，state_get / 路径就绪之后）──────────────────────
 source "$LIB_DIR/i18n.sh" || { echo "PSM: cannot load $LIB_DIR/i18n.sh" >&2; exit 1; }
 i18n_init
+
+# psm reality probe <domain> [--json]: whether <domain> works as a borrowed
+# REALITY site, checked from this server — TLS 1.3 with X25519 and a
+# certificate for that name on port 443 (reality_validate_dest), whether it
+# offers HTTP/2, the handshake time, and whether it sits on a shared CDN
+# frontend (reality_dest_is_shared_frontend: then anyone without the key
+# reaches the whole CDN through the node). Read-only: nothing is changed.
+psm_reality_cli() {
+    local sub="${1:-}" host="" json=false ok=false shared=false
+    shift || true
+    [[ "$sub" == probe ]] || { printf 'Usage:\n  psm reality probe DOMAIN [--json]   can REALITY borrow this site from this server?\n' >&2; return 2; }
+    while (( $# )); do
+        case "$1" in
+            --json) json=true ;;
+            -*) echo "psm reality probe: unknown option $1" >&2; return 2 ;;
+            *) [[ -z "$host" ]] && host="$1" || { echo "psm reality probe: one domain" >&2; return 2; } ;;
+        esac
+        shift
+    done
+    host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$host" ]] || ! is_domain "$host" || [[ "$host" =~ ^[0-9.]+$ ]]; then
+        echo "psm reality probe: a domain, such as www.samsung.com" >&2; return 2
+    fi
+    reality_validate_dest "$host:443" "$host" && ok=true
+    [[ "$ok" == true && "$REALITY_DEST_WARN" == shared_frontend:* ]] && shared=true
+    # a failed handshake skips the shared-frontend check: probe it anyway
+    if [[ "$ok" != true ]] && reality_dest_is_shared_frontend "$host" 443; then
+        shared=true; REALITY_DEST_WARN="shared_frontend:${REALITY_DEST_SHARED_BY}"
+    fi
+    if [[ "$json" == true ]]; then
+        jq -cn --arg host "$host" --argjson ok "$ok" --arg reason "$REALITY_DEST_REASON" \
+            --arg rtt "${REALITY_DEST_RTT_MS:-}" --arg alpn "${REALITY_DEST_ALPN:-}" \
+            --argjson shared "$shared" --arg by "${REALITY_DEST_WARN#shared_frontend:}" '
+            {host: $host, ok: $ok, reason: (if $reason == "" then null else $reason end),
+             rtt_ms: (if $rtt == "" then null else ($rtt | tonumber) end),
+             h2: ($alpn == "h2"), shared_frontend: $shared,
+             shared_by: (if $shared then $by else null end)}'
+    else
+        printf '%s: %s' "$host" "$( [[ "$ok" == true ]] && echo usable || echo "not usable (${REALITY_DEST_REASON})")"
+        [[ -n "${REALITY_DEST_RTT_MS:-}" ]] && printf ', %s ms' "$REALITY_DEST_RTT_MS"
+        [[ "${REALITY_DEST_ALPN:-}" == h2 ]] && printf ', h2'
+        [[ "$shared" == true ]] && printf ', shared CDN frontend (anyone without the key reaches the whole CDN)'
+        printf '\n'
+    fi
+    return 0
+}
+

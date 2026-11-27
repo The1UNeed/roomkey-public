@@ -48,11 +48,12 @@ import (
 	"time"
 )
 
-const agentVersion = "0.14.0"
+const agentVersion = "0.15.0"
 
 const (
 	commandTimeout  = 120 * time.Second // one psm command
 	checkTimeout    = 3 * time.Minute   // psm check: fetching ipcheck, then its requests
+	probeTimeout    = time.Minute       // psm reality probe: a handshake and three CDN probes
 	installTimeout  = 15 * time.Minute  // installing a core or a standalone server
 	requestTimeout  = 30 * time.Second  // one request to the panel
 	maxTaskData     = 64 << 10          // a task's node settings
@@ -702,7 +703,7 @@ func (a *agent) execute(ctx context.Context, t task) result {
 		if _, ok := goodPort(obj["port"]); !ok {
 			return rejected(t, "bad port")
 		}
-		ownSite := obj["own_site"] == true
+		ownSite, borrowed := obj["own_site"] == true, borrowedOf(obj)
 		if why := a.ownSiteReady(ctx, t.Protocol, obj); why != "" {
 			return rejected(t, why)
 		}
@@ -727,9 +728,10 @@ func (a *agent) execute(ctx context.Context, t task) result {
 			return fail(err)
 		}
 		// REALITY on its own site: what PSM stored must fall back to this server
-		// only; anything else is taken down again and reported
-		if ownSite {
-			if why := a.ownSiteHolds(ctx, t.Core, t.Protocol, tag); why != "" {
+		// only (a borrowed site: to that site only); anything else is taken
+		// down again and reported
+		if ownSite || borrowed != "" {
+			if why := a.ownSiteHolds(ctx, t.Core, t.Protocol, tag, borrowed); why != "" {
 				if _, err := a.psm(ctx, nil, "node", "delete", t.Core, t.Protocol, tag, "--yes", "--if-exists", "--json"); err != nil {
 					// still here, and made by this create: the panel's to remove
 					r.Output = json.RawMessage(`{"created":true}`)
@@ -762,8 +764,8 @@ func (a *agent) execute(ctx context.Context, t task) result {
 		if err != nil {
 			return fail(err)
 		}
-		if upd["own_site"] == true {
-			if why := a.ownSiteHolds(ctx, t.Core, t.Protocol, t.Tag); why != "" {
+		if upd["own_site"] == true || borrowedOf(upd) != "" {
+			if why := a.ownSiteHolds(ctx, t.Core, t.Protocol, t.Tag, borrowedOf(upd)); why != "" {
 				return fail(errors.New(why + " (the node is still there; its core will not start with it: PSM refuses such a config)"))
 			}
 		}
@@ -1015,6 +1017,48 @@ func (a *agent) execute(ctx context.Context, t task) result {
 			return fail(err)
 		}
 		r.OK, r.Output = true, jsonOrNil(out)
+	case "reality.probe":
+		// Whether sites work as a borrowed REALITY site, seen from this server
+		// (TLS 1.3, X25519, its certificate, HTTP/2, a shared CDN frontend):
+		// read-only, the panel's 探测 and 扫描 buttons. One site or up to 12,
+		// each its own psm reality probe; the answer is their list.
+		var q struct {
+			Host  string   `json:"host"`
+			Hosts []string `json:"hosts"`
+		}
+		if json.Unmarshal(t.Data, &q) != nil {
+			return rejected(t, "reality.probe: bad data")
+		}
+		hosts := q.Hosts
+		if q.Host != "" {
+			hosts = append([]string{q.Host}, hosts...)
+		}
+		if len(hosts) == 0 || len(hosts) > 12 {
+			return rejected(t, "reality.probe: 1 to 12 domains")
+		}
+		for i, h := range hosts {
+			hosts[i] = strings.ToLower(h)
+			if !borrowedSiteRe.MatchString(hosts[i]) || len(hosts[i]) > 253 {
+				return rejected(t, "reality.probe: a domain, such as www.samsung.com")
+			}
+		}
+		if !a.capsHave(ctx, "reality.probe") {
+			return rejected(t, "this server's PSM cannot probe sites: update PSM (psm agent upgrade)")
+		}
+		var all []json.RawMessage
+		for _, h := range hosts {
+			out, err := a.psmFor(ctx, probeTimeout, nil, "reality", "probe", h, "--json")
+			if err != nil {
+				b, _ := json.Marshal(map[string]any{"host": h, "ok": false, "reason": err.Error()})
+				all = append(all, b)
+				continue
+			}
+			if o := jsonOrNil(out); o != nil {
+				all = append(all, o)
+			}
+		}
+		b, _ := json.Marshal(map[string]any{"sites": all})
+		r.OK, r.Output = true, b
 	case "traffic.report": // the panel's 流量 page asks for the counters now
 		a.lastTraffic = time.Time{}
 		r.OK = true

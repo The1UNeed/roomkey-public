@@ -57,6 +57,63 @@ if psm_reality_guard sing-box 2>/dev/null; then fail "sing-box REALITY with a th
 echo '{"listeners":[{"type":"vless","reality-config":{"dest":"example.com:443"}}]}' > "$MIHOMO_CFG_DIR/config.yaml"
 if psm_reality_guard mihomo 2>/dev/null; then fail "mihomo REALITY with a third-party dest passed the guard"; fi
 
+# A borrowed site (borrowed_site: the owner's informed choice): that one
+# site, a domain on 443 that is the node's SNI, passes; nothing else does.
+# (the shared-frontend probe is stubbed: no network in the tests)
+reality_dest_is_shared_frontend() { [[ "$1" == www.cloudflare.com ]] && { REALITY_DEST_SHARED_BY=cdnjs.cloudflare.com; return 0; }; return 1; }
+out=$(psm_node_cli node add xray reality --tag lent-1 --port 31447 \
+    --data '{"borrowed_site":true,"server_name":"WWW.Samsung.com","dest":"10.0.0.1:80",'"$keys"'}' --json --show-secrets --store-only)
+jq -e '.item.node | .dest == "www.samsung.com:443" and .server_name == "www.samsung.com" and .server_names_raw == "www.samsung.com" and (has("limit_fallback") | not)' \
+    <<<"$out" >/dev/null || fail "borrowed add: $out"
+# not store-only, so the probe runs: a CDN-shared site is speed-limited, not
+# refused (the step on its own: a real add needs root and a core)
+out=$(_node_cli_borrowed_site xray reality '{"borrowed_site":true,"server_name":"www.cloudflare.com","dest":"www.cloudflare.com:443"}' false 2>/dev/null)
+jq -e '.limit_fallback == true and .shared_frontend == true and .dest == "www.cloudflare.com:443"' <<<"$out" >/dev/null \
+    || fail "borrowed CDN site without the speed limit: $out"
+out=$(_node_cli_borrowed_site xray reality '{"borrowed_site":true,"server_name":"www.amd.com","limit_fallback":true}' false 2>/dev/null)
+jq -e '(has("limit_fallback") | not) and .shared_frontend == false and .dest == "www.amd.com:443"' <<<"$out" >/dev/null \
+    || fail "borrowed single-tenant site: $out"
+# without borrowed_site the same CDN site is refused, as before
+if psm_node_cli node add xray reality --tag third-cf --port 31449 \
+    --data '{"server_name":"www.cloudflare.com","dest":"www.cloudflare.com:443",'"$keys"'}' --store-only --json >/dev/null 2>&1; then
+    fail "accepted a CDN-shared target without borrowed_site"
+fi
+for bad in '{"borrowed_site":true,"server_name":"192.0.2.7",'"$keys"'}' \
+           '{"borrowed_site":true,"own_site":true,"server_name":"www.amd.com",'"$keys"'}'; do
+    if psm_node_cli node add xray reality --tag lent-bad --port 31450 --data "$bad" --store-only --json >/dev/null 2>&1; then
+        fail "borrowed site accepted: $bad"
+    fi
+done
+# the core guard: the store's borrowed pair passes, any other target on that
+# tag (or the pair on another tag, or a non-443 port) does not
+echo '{"inbounds":[{"tag":"lent-1","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.samsung.com:443"}}}]}' > "$XRAY_CFG_DIR/config.json"
+psm_reality_guard xray || fail "Xray REALITY on its borrowed site refused"
+for bad in '{"inbounds":[{"tag":"lent-1","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.apple.com:443"}}}]}' \
+           '{"inbounds":[{"tag":"other","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.samsung.com:443"}}}]}' \
+           '{"inbounds":[{"tag":"lent-1","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.samsung.com:8443"}}}]}' \
+           '{"inbounds":[{"tag":"lent-1","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.samsung.com:443","target":"10.0.0.1:80"}}}]}'; do
+    printf '%s' "$bad" > "$XRAY_CFG_DIR/config.json"
+    if psm_reality_guard xray 2>/dev/null; then fail "Xray guard passed: $bad"; fi
+done
+psm_node_cli node add sing-box reality --tag lent-sb --port 31451 \
+    --data '{"borrowed_site":true,"server_name":"www.amd.com",'"$keys"'}' --store-only --json >/dev/null || fail "sing-box borrowed add"
+echo '{"inbounds":[{"tag":"lent-sb","type":"vless","tls":{"reality":{"enabled":true,"handshake":{"server":"www.amd.com","server_port":443}}}}]}' > "$SINGBOX_CFG_DIR/config.json"
+psm_reality_guard sing-box || fail "sing-box REALITY on its borrowed site refused"
+echo '{"inbounds":[{"tag":"lent-sb","type":"vless","tls":{"reality":{"enabled":true,"handshake":{"server":"www.amd.com","server_port":80}}}}]}' > "$SINGBOX_CFG_DIR/config.json"
+if psm_reality_guard sing-box 2>/dev/null; then fail "sing-box guard passed another port of the borrowed site"; fi
+psm_node_cli node add mihomo reality --tag lent-mh --port 31452 \
+    --data '{"borrowed_site":true,"server_name":"www.nvidia.com",'"$keys"'}' --store-only --json >/dev/null || fail "mihomo borrowed add"
+echo '{"listeners":[{"name":"lent-mh","type":"vless","reality-config":{"dest":"www.nvidia.com:443"}}]}' > "$MIHOMO_CFG_DIR/config.yaml"
+psm_reality_guard mihomo || fail "mihomo REALITY on its borrowed site refused"
+echo '{"listeners":[{"name":"lent-mh","type":"vless","reality-config":{"dest":"www.apple.com:443"}}]}' > "$MIHOMO_CFG_DIR/config.yaml"
+if psm_reality_guard mihomo 2>/dev/null; then fail "mihomo guard passed another site on a borrowed node"; fi
+# back to its own site: the borrowed pair is gone with it
+out=$(psm_node_cli node update xray reality lent-1 --data '{"borrowed_site":false,"own_site":true,"server_name":"n9.example.org"}' --store-only --json --show-secrets)
+jq -e '.item.node | .dest == "127.0.0.1:8443" and .own_site == true' <<<"$out" >/dev/null || fail "borrowed → own site: $out"
+echo '{"inbounds":[{"tag":"lent-1","protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"www.samsung.com:443"}}}]}' > "$XRAY_CFG_DIR/config.json"
+if psm_reality_guard xray 2>/dev/null; then fail "a node moved to its own site kept its borrowed pass"; fi
+unset -f reality_dest_is_shared_frontend
+
 # strict: exactly PSM's own site, both Xray fields, ShadowTLS too, and an unreadable config is refused
 for bad in '{"inbounds":[{"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"127.0.0.1:9000"}}}]}' \
            '{"inbounds":[{"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"dest":"127.0.0.1:8443","target":"www.apple.com:443"}}}]}' \
@@ -127,4 +184,4 @@ os_out=$( source "$PSM_ROOT/lib/nginx.sh" >/dev/null 2>&1
     echo "$(tr '\n' ' ' <"$tmp_dir/probes")elapsed $(( SECONDS - start ))" )
 [[ "$os_out" == "probe 8 probe 1 elapsed 10" ]] || fail "stalled probes outlast the deadline: $os_out"
 
-echo "ok: REALITY own site, the final REALITY guard and the abuse rules"
+echo "ok: REALITY own site, borrowed sites, the final REALITY guard and the abuse rules"

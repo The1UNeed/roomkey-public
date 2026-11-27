@@ -550,12 +550,36 @@ step "A few questions (remembered for next time)"
 note "The panel gets two addresses on your Cloudflare domain: one for you (the admin page),"
 note "one for subscriptions and servers. The domain must already be on this Cloudflare account."
 note "Press Enter to take the suggestion in [brackets]."
-ask ADMIN_HOST "Admin page address" "${ADMIN_HOST:-admin.myroom.asia}"
-ask SUB_HOST "Subscription address (friends' clients and servers use it)" "${SUB_HOST:-sub.myroom.asia}"
-for h in "$ADMIN_HOST" "$SUB_HOST"; do
-    [[ "$h" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] || die "not a host name: $h"
+is_host() { [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; }
+if [[ -z "${ADMIN_HOST:-}" || -z "${SUB_HOST:-}" ]]; then
+    # first run: the domain, then admin.<domain> and sub.<domain> are suggested.
+    # The domains on the Cloudflare account are offered when the token can list them.
+    zones=""
+    if [[ $DRY == 0 && -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        zones=$( { cf_api "/zones?per_page=50${CLOUDFLARE_ACCOUNT_ID:+&account.id=$CLOUDFLARE_ACCOUNT_ID}" || true; } | cf_json '(j.result ?? []).map((z) => z.name).join(" ")')
+        [[ "$zones" == '!'* ]] && zones=""
+    fi
+    [[ -n "$zones" ]] && note "Domains on this Cloudflare account: ${zones// /, }"
+    while :; do
+        ask DOMAIN "Your domain on Cloudflare (for example example.com)" "${zones%% *}"
+        DOMAIN=$(tr '[:upper:]' '[:lower:]' <<<"$DOMAIN")
+        is_host "$DOMAIN" && break
+        warn "${DOMAIN:-nothing typed}: type a domain name such as example.com"
+    done
+fi
+while :; do
+    ask ADMIN_HOST "Admin page address" "${ADMIN_HOST:-${DOMAIN:+admin.$DOMAIN}}"
+    ADMIN_HOST=$(tr '[:upper:]' '[:lower:]' <<<"$ADMIN_HOST")
+    is_host "$ADMIN_HOST" && break
+    warn "not a host name: $ADMIN_HOST (for example admin.example.com)"; ADMIN_HOST=""
 done
-[[ "$ADMIN_HOST" != "$SUB_HOST" ]] || die "the admin and subscription addresses must differ"
+while :; do
+    ask SUB_HOST "Subscription address (friends' clients and servers use it)" "${SUB_HOST:-sub.${DOMAIN:-${ADMIN_HOST#*.}}}"
+    SUB_HOST=$(tr '[:upper:]' '[:lower:]' <<<"$SUB_HOST")
+    if ! is_host "$SUB_HOST"; then warn "not a host name: $SUB_HOST (for example sub.example.com)"; SUB_HOST=""
+    elif [[ "$SUB_HOST" == "$ADMIN_HOST" ]]; then warn "the subscription address must differ from the admin address"; SUB_HOST=""
+    else break; fi
+done
 save ADMIN_HOST "$ADMIN_HOST"; save SUB_HOST "$SUB_HOST"
 
 # everything the deploy needs, checked now rather than halfway through it
@@ -623,6 +647,46 @@ while :; do
 done
 [[ -n "$CF_DNS_TOKEN" ]] && save CF_ZONE_ID "$CF_ZONE_ID"
 
+# the panel updating itself (系统设置 → 更新): in the update window it installs
+# new roomkey releases with a token that can edit its Worker (kept as the
+# CF_UPDATE_TOKEN secret). Servers update in that window either way.
+CF_UPDATE_TOKEN=""
+note "The panel can install new roomkey releases by itself, in an update window you pick"
+note "(系统设置 → 更新). For that it keeps a Cloudflare token that can edit its Worker."
+if yes_no "Let the panel update itself?" "$( [[ "${SELF_UPDATE:-1}" == 1 ]] && echo y || echo n )"; then
+    while :; do
+        if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+            note "Press Enter to use the token you gave above, or paste one with only"
+            note "Account · Workers Scripts · Edit (safer: the panel keeps it)."
+            ask_secret CF_UPDATE_TOKEN "Update token [Enter = the token above]" 4
+            [[ -n "$CF_UPDATE_TOKEN" ]] || CF_UPDATE_TOKEN="$CLOUDFLARE_API_TOKEN"
+        else
+            note "Paste a Cloudflare API token with Account · Workers Scripts · Edit"
+            note "(Cloudflare → Manage Account → Account API Tokens → Create Token)."
+            if [[ "${SELF_UPDATE:-}" == 1 ]]; then
+                ask_secret CF_UPDATE_TOKEN "Update token [Enter = keep the panel's]" 4
+                [[ -n "$CF_UPDATE_TOKEN" ]] || { note "keeping the panel's update token"; break; }
+            else
+                ask_secret CF_UPDATE_TOKEN "Update token [Enter = skip]" 4
+                [[ -n "$CF_UPDATE_TOKEN" ]] || { SELF_UPDATE=0; note "skipped: the panel does not update itself (run this script again to update it)"; break; }
+            fi
+        fi
+        note "got $(token_hint "$CF_UPDATE_TOKEN")"
+        [[ $DRY == 1 || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]] && break
+        r=$( { CLOUDFLARE_API_TOKEN="$CF_UPDATE_TOKEN" cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" || true; } | cf_json '"ok"')
+        if [[ "$r" == ok ]]; then ok "that token can edit Workers on this account"; break; fi
+        cf_says "${r:-!no answer}"
+        warn "that token cannot edit Workers on this account (it needs Account · Workers Scripts · Edit)"
+        CF_UPDATE_TOKEN=""
+        yes_no "Try another token?" y || { SELF_UPDATE=0; break; }
+    done
+    [[ "${SELF_UPDATE:-1}" != 0 ]] && SELF_UPDATE=1
+else
+    SELF_UPDATE=0
+    note "skipped: you update the panel by running this script again (servers still update in the window)"
+fi
+save SELF_UPDATE "$SELF_UPDATE"
+
 # ── 5. what servers download ──────────────────────────────────────────────────
 step "Building what servers download from the panel (PSM + psm-agent)"
 ( cd "$PANEL" && bash scripts/bundle.sh >/dev/null ) || die "building the bundle failed (see above)"
@@ -670,12 +734,15 @@ fi
 save DB_NAME "$DB_NAME"
 # the deploy's own config: wrangler.jsonc plus your addresses and database
 ADMIN_HOST="$ADMIN_HOST" SUB_HOST="$SUB_HOST" DB_NAME="$DB_NAME" DB_ID="$DB_ID" CF_ZONE_ID="${CF_ZONE_ID:-}" \
+CF_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}" UPDATE_REPO="${ROOMKEY_REPO:-The1UNeed/roomkey-public}" \
 node -e '
   const fs = require("fs")
   const src = fs.readFileSync(process.argv[1], "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n")
   const c = JSON.parse(src), e = process.env
   c.name = "roomkey"
-  c.vars = { ...c.vars, ADMIN_HOSTS: e.ADMIN_HOST, PANEL_URL: `https://${e.SUB_HOST}`, ...(e.CF_ZONE_ID ? { CF_ZONE_ID: e.CF_ZONE_ID } : {}) }
+  // WORKER_NAME, CF_ACCOUNT_ID and UPDATE_REPO: where the panel updates itself (with the CF_UPDATE_TOKEN secret)
+  c.vars = { ...c.vars, ADMIN_HOSTS: e.ADMIN_HOST, PANEL_URL: `https://${e.SUB_HOST}`, ...(e.CF_ZONE_ID ? { CF_ZONE_ID: e.CF_ZONE_ID } : {}),
+    WORKER_NAME: c.name, UPDATE_REPO: e.UPDATE_REPO, ...(e.CF_ACCOUNT_ID ? { CF_ACCOUNT_ID: e.CF_ACCOUNT_ID } : {}) }
   c.d1_databases = [{ ...c.d1_databases[0], database_name: e.DB_NAME, database_id: e.DB_ID }]
   c.routes = [{ pattern: e.ADMIN_HOST, custom_domain: true }, { pattern: e.SUB_HOST, custom_domain: true }]
   fs.writeFileSync(process.argv[2], "// written by setup.sh (not committed): wrangler.jsonc with your addresses and database\n" + JSON.stringify(c, null, 2) + "\n")
@@ -701,12 +768,13 @@ fi
 # ── 7. deploy ─────────────────────────────────────────────────────────────────
 step "Deploying the panel to Cloudflare"
 secrets=$(mktemp); chmod 600 "$secrets"; trap 'rm -f "$secrets"' EXIT
-ADMIN_PASSWORD="$ADMIN_PASSWORD" ADMIN_USERNAME="$ADMIN_USER" CF_DNS_TOKEN="$CF_DNS_TOKEN" KEY="$( (( send_key )) && cat "$KEY_FILE" || true)" node -e '
+ADMIN_PASSWORD="$ADMIN_PASSWORD" ADMIN_USERNAME="$ADMIN_USER" CF_DNS_TOKEN="$CF_DNS_TOKEN" CF_UPDATE_TOKEN="$CF_UPDATE_TOKEN" KEY="$( (( send_key )) && cat "$KEY_FILE" || true)" node -e '
   const e = process.env, s = {}
   if (e.ADMIN_PASSWORD) s.ADMIN_PASSWORD = e.ADMIN_PASSWORD
   if (e.ADMIN_USERNAME) s.ADMIN_USERNAME = e.ADMIN_USERNAME
   if (e.KEY) s.TOKEN_KEY = e.KEY.trim()
   if (e.CF_DNS_TOKEN) s.CF_DNS_TOKEN = e.CF_DNS_TOKEN
+  if (e.CF_UPDATE_TOKEN) s.CF_UPDATE_TOKEN = e.CF_UPDATE_TOKEN
   require("fs").writeFileSync(process.argv[1], JSON.stringify(s))
 ' "$secrets"
 if [[ $DRY == 1 ]]; then

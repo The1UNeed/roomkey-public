@@ -98,7 +98,7 @@ async function reset(n: Row) {
       <span class="grow" /><span class="muted">{{ rows.length }} 个节点</span>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="cards">
         <thead><tr>
           <th class="sortable" @click="sortBy('name')">节点{{ arrow('name') }}</th>
           <th class="sortable" @click="sortBy('server')">服务器{{ arrow('server') }}</th>
@@ -110,17 +110,17 @@ async function reset(n: Row) {
         <tbody>
           <tr v-for="n in rows" :key="n.id" :data-test="`traffic-${n.name}`">
             <td><b>{{ n.name }}</b></td>
-            <td>{{ n.server }}</td>
-            <td class="num">{{ formatBytes(n.traffic_used) }}</td>
-            <td class="num">{{ n.traffic_limit_gb ? `${n.traffic_limit_gb} GB` : '不限' }}</td>
-            <td>
+            <td data-label="服务器">{{ n.server }}</td>
+            <td class="num" data-label="本月已用">{{ formatBytes(n.traffic_used) }}</td>
+            <td class="num" data-label="上限">{{ n.traffic_limit_gb ? `${n.traffic_limit_gb} GB` : '不限' }}</td>
+            <td :class="{ 'hide-phone': !n.traffic_limit_gb }" data-label="用量">
               <div v-if="n.traffic_limit_gb" class="meter"><span :class="{ over: pct(n) >= 80, full: pct(n) >= 100 }" :style="{ width: `${pct(n)}%` }" /></div>
               <span v-else class="faint">—</span>
             </td>
-            <td>每月 {{ n.reset_day }} 日</td>
+            <td data-label="重置">每月 {{ n.reset_day }} 日</td>
             <td><span class="status" :class="n.traffic_paused ? 'failed' : 'applied'"><span class="dot" />{{ n.traffic_paused ? '已暂停' : '正常' }}</span></td>
-            <td :title="localTime(n.traffic_at)">{{ ago(n.traffic_at) }}</td>
-            <td class="actions"><button class="btn small ghost" :disabled="n.status !== 'applied'" @click="reset(n)"><Icon name="refresh" />重置</button></td>
+            <td :title="localTime(n.traffic_at)" data-label="更新于">{{ ago(n.traffic_at) }}</td>
+            <td class="actions"><span class="row-actions"><button class="btn small ghost" :disabled="n.status !== 'applied'" @click="reset(n)"><Icon name="refresh" />重置流量</button></span></td>
           </tr>
         </tbody>
       </table>

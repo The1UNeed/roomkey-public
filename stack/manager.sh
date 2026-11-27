@@ -38,9 +38,14 @@ case "${1:-}" in
         ;;
     caps)
         # what this PSM can do, for psm-agent (roomkey): it sends REALITY's own
-        # site and the panel's user lists only to a PSM that says so
-        printf '%s\n' '{"caps":["reality.own_site","reality.guard","users.import.revision","users.purge","abuse.rules","core.guard"]}'
+        # site, a borrowed site and the panel's user lists only to a PSM that says so
+        printf '%s\n' '{"caps":["reality.own_site","reality.guard","reality.borrowed","reality.probe","users.import.revision","users.purge","abuse.rules","core.guard"]}'
         exit 0
+        ;;
+    reality)
+        shift
+        psm_reality_cli "$@"
+        exit $?
         ;;
     user)
         shift
@@ -112,15 +117,15 @@ Usage:
                               Standalone Snell (v4/v5/v6) and ss-rust: install, show, export, remove
   psm traffic list|set|reset|unset [...]
                               Traffic metering and limits per node
-  psm agent join|status|remove [...]
-                              Connect this server to a PSM panel (psm-agent)
+  psm agent join|status|upgrade|remove [...]
+                              Connect this server to the roomkey panel (psm-agent)
   psm sni find [...]          REALITY camouflage targets in this server's network (mapping engine + TLS check)
-  psm sni check --input -     the TLS check alone, for candidates found elsewhere (the panel's engine query)
+  psm sni check --input -     The TLS check alone, for candidates found elsewhere
+  psm reality probe DOMAIN [--json]
+                              Can REALITY borrow this site from here? (TLS 1.3, X25519, h2, shared CDN)
   psm exit status|warp|vpngate [...]
                               The WARP and free residential exits (a node uses one with --exit)
-  psm relay list|show|off|delete [...]
-                              Relays are off in roomkey: list what an older install left
-                              and remove it (psm relay off)
+  psm relay list|off [...]    Relays are off in roomkey: remove what an older install left
   psm check [all|ip|mail|unlock] [-4|-6] [--keys-stdin] [--json]
                               This server's IP from outside: owner, native or broadcast,
                               kind, risk scores, mail and blacklists, and which streaming
@@ -134,7 +139,7 @@ Node commands:
   psm node show CORE PROTOCOL TAG [--json]
   psm node add CORE PROTOCOL --tag TAG [options]
   psm node update CORE PROTOCOL TAG [options]
-  psm node delete CORE PROTOCOL TAG [--yes]
+  psm node delete CORE PROTOCOL TAG --yes
   psm node export CORE PROTOCOL TAG [--format FORMAT] [--json]
 
 Run `psm node help` for the full option reference.

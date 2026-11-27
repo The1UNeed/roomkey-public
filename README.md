@@ -15,7 +15,7 @@ It asks what you want:
 1. **A new panel.** It signs you in to Cloudflare, asks for your two addresses, makes an admin username and a strong password for you (or takes yours), deploys the panel, and gives you the install command for your first server. It can install that server right there, too.
 2. **Connect this server to a panel you already have** (`--join`). It signs in to your panel, adds this server and installs it.
 
-Every question shows a suggestion in [brackets]: press Enter to take it. A server must be **freshly installed**: roomkey refuses one that already runs other proxies or nginx, and changes nothing there. From a checkout, `./setup.sh` does the same. Details: [docs/DEPLOY.md](docs/DEPLOY.md).
+Every question shows a suggestion in [brackets]: press Enter to take it. The panel can also keep itself and every server up to date: in 系统设置 → 更新, pick an update window and turn on automatic updates. New releases are installed then, the panel first. A server must be **freshly installed**: roomkey refuses one that already runs other proxies or nginx, and changes nothing there. From a checkout, `./setup.sh` does the same. Details: [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Layout
 
@@ -40,7 +40,7 @@ git subtree pull --prefix=3x-ui https://github.com/MHSanaei/3x-ui.git main --squ
 ## Rules for this project
 
 - The panel never carries proxy traffic. It only serves the admin page, subscriptions and the node API.
-- REALITY's fallback (`dest` / `target`) points at the node's own site, never at a third-party or CDN-hosted domain.
+- REALITY's fallback (`dest` / `target`) points at the node's own site by default. Borrowing another site (www.samsung.com, say) is an explicit per-node choice: you tick that you accept the risk, the target is one domain on port 443 that is also the node's SNI, and a target on a shared CDN (Cloudflare, for example) gets a fallback speed limit and a warning. Every other off-server fallback is still refused when the core starts.
 - Don't put "vpn" in hostnames. Use names like `sub.myroom.asia` and `n1.myroom.asia`.
 
 ## License

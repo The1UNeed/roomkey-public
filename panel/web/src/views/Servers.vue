@@ -91,9 +91,9 @@ async function remove(s: Server) {
           body: `${s.name} 正在卸载面板建的内容。没有进展的话，这会重新发出卸载。` }
     : onServer
       ? { title: `移除服务器 ${s.name}？`, danger: true, ok: '卸载并移除', typed: s.name,
-          body: '服务器上由面板建的节点、独立安装的 Snell / ss-rust 和 psm-agent 会被卸载。\nPSM 本身、内核和在服务器命令行里建的节点会保留。' }
+          body: '服务器上由面板建的节点、独立安装的 Snell / ss-rust 和服务器组件会被卸载。\nPSM 本身、内核和在服务器命令行里建的节点会保留。' }
       : { title: `只从面板移除 ${s.name}？`, danger: true, ok: '只从面板移除',
-          body: `${s.name} 现在${s.status === 'leaving' ? '没有回应' : '离线'}，无法在服务器上卸载。\n服务器上的节点和 psm-agent 会保留；之后可以在服务器上执行 psm agent remove --yes 卸载 psm-agent。` })
+          body: `${s.name} 现在${s.status === 'leaving' ? '没有回应' : '离线'}，无法在服务器上卸载。\n服务器上的节点和组件会保留；之后可以在服务器上执行 psm agent remove --yes 卸载组件。` })
   if (!ok) return
   try {
     await api(`/api/servers/${s.id}${onServer || s.status === 'pending' ? '' : '?force=1'}`, { method: 'DELETE' })
@@ -104,6 +104,9 @@ async function remove(s: Server) {
   await load()
 }
 
+// the line under a server's name: its host name or note, when it says more than the name
+const subName = (s: Server) => (s.hostname && s.hostname !== s.name ? s.hostname : s.note || '')
+
 // ── psm-agent and PSM on the server ──────────────────────────────────────────
 // The same task: PSM is updated first, then the psm-agent PSM names is
 // installed (a current one stays). The panel asks for the nodes' links again
@@ -111,12 +114,12 @@ async function remove(s: Server) {
 async function upgrade(s: Server) {
   const agent = outdated(s)
   const ok = await confirmAction(agent
-    ? { title: `升级 ${s.name} 的 psm-agent？`, ok: '升级', body: `从 ${s.agent_version} 升级到 ${s.agent_latest}。服务器上会先更新 PSM，检查内核的启动检查并撤下中转（运行中的内核会重启一下），再替换 psm-agent 并重启它。` }
+    ? { title: `更新 ${s.name}？`, ok: '更新', body: `服务器组件从 ${s.agent_version} 更新到 ${s.agent_latest}。运行中的节点会短暂重启（几秒），之后照常可用。` }
     : { title: `更新 ${s.name} 上的 PSM？`, ok: '更新', body: '更新到最新版；会先检查内核的启动检查并撤下中转（运行中的内核会重启一下）。更新后面板会重新取一次节点的链接和订阅（服务器下次报告版本时，最多一小时；点「诊断」立即生效）。' })
   if (!ok) return
   try {
     await api(`/api/servers/${s.id}/upgrade-agent`, { method: 'POST' })
-    toast(agent ? `已通知 ${s.name} 升级 psm-agent，完成后版本列会变成 ${s.agent_latest}` : `已通知 ${s.name} 更新 PSM`)
+    toast(agent ? `已通知 ${s.name} 更新，完成后版本列会变成 ${s.agent_latest}` : `已通知 ${s.name} 更新 PSM`)
   } catch (e) {
     toast(errorText(e), 'err')
   }
@@ -204,7 +207,7 @@ const counts = computed(() => ({
   <div class="page-head">
     <div>
       <h1>服务器</h1>
-      <p>{{ servers.length }} 台，{{ counts.online }} 台在线<template v-if="counts.outdated">，{{ counts.outdated }} 台的 psm-agent 可升级</template>。服务器由 psm-agent 主动连接面板，不需要开放端口。</p>
+      <p>{{ servers.length }} 台，{{ counts.online }} 台在线<template v-if="counts.outdated">，{{ counts.outdated }} 台可更新</template>。服务器主动连接面板，不用开放任何端口。</p>
     </div>
     <div class="page-actions">
       <button class="btn primary" data-test="add-server-open" @click="add.open = true"><Icon name="plus" />添加服务器</button>
@@ -213,11 +216,11 @@ const counts = computed(() => ({
 
   <div class="card">
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>服务器</th><th>状态</th><th>地址</th><th>PSM / Agent</th><th class="num">节点</th><th class="num">本月流量</th><th class="actions">操作</th></tr></thead>
+      <table class="cards">
+        <thead><tr><th>服务器</th><th>状态</th><th>地址</th><th>版本</th><th class="num">节点</th><th class="num">本月流量</th><th class="actions">操作</th></tr></thead>
         <tbody>
           <tr v-for="s in servers" :key="s.id" :data-test="`server-${s.name}`" :data-status="s.status">
-            <td><b>{{ s.name }}</b><span class="sub">{{ s.hostname ?? (s.note || '—') }}</span></td>
+            <td><b>{{ s.name }}</b><span v-if="subName(s)" class="sub">{{ subName(s) }}</span></td>
             <td>
               <span class="status" :class="s.status"><span class="dot" />{{ statusText[s.status] }}</span>
               <span v-if="s.leave_error" class="badge err" :title="s.leave_error">卸载失败</span>
@@ -230,20 +233,20 @@ const counts = computed(() => ({
               <span v-if="s.asn" class="sub">{{ flag(s.country) }} AS{{ s.asn }}{{ s.country ? ` · ${s.country}` : '' }}</span>
               <span v-if="s.users_error" class="badge warn" :title="s.users_error">用户未下发</span>
             </td>
-            <td>
-              <span class="small">{{ s.psm_version ?? '—' }}</span>
-              <span class="sub">agent {{ s.agent_version ?? '—' }}
-                <button v-if="outdated(s) && s.status === 'online'" class="badge accent link-btn" style="border: 0" :title="`可升级到 ${s.agent_latest}`"
-                        :data-test="`upgrade-badge-${s.name}`" @click="upgrade(s)">可升级</button></span>
+            <td data-label="版本" class="wide-phone">
+              <span>组件 {{ s.agent_version ?? '—' }}
+                <button v-if="outdated(s) && s.status === 'online'" class="badge accent link-btn" style="border: 0" :title="`服务器组件可更新到 ${s.agent_latest}`"
+                        :data-test="`upgrade-badge-${s.name}`" @click="upgrade(s)">可更新</button></span>
+              <span class="sub">PSM {{ s.psm_version ?? '—' }}</span>
             </td>
-            <td class="num">{{ s.node_count }}</td>
-            <td class="num">{{ formatBytes(s.traffic_used) }}</td>
+            <td class="num" data-label="节点">{{ s.node_count }}</td>
+            <td class="num" data-label="本月流量">{{ formatBytes(s.traffic_used) }}</td>
             <td class="actions">
               <span class="row-actions">
                 <button class="btn small ghost" :disabled="s.status === 'pending'" :data-test="`diagnose-${s.name}`" @click="diagnose(s)"><Icon name="stethoscope" />诊断</button>
                 <button class="btn small ghost" :data-test="`command-${s.name}`" @click="newCommand(s)"><Icon name="terminal" />安装命令</button>
                 <RowMenu :test="`more-${s.name}`">
-                  <button v-if="outdated(s)" type="button" :disabled="s.status !== 'online'" :data-test="`upgrade-agent-${s.name}`" @click="upgrade(s)"><Icon name="upload" />升级 psm-agent</button>
+                  <button v-if="outdated(s)" type="button" :disabled="s.status !== 'online'" :data-test="`upgrade-agent-${s.name}`" @click="upgrade(s)"><Icon name="upload" />更新这台服务器</button>
                   <button v-else type="button" :disabled="s.status !== 'online'" :data-test="`update-psm-${s.name}`" @click="upgrade(s)"><Icon name="upload" />更新 PSM</button>
                   <button type="button" :disabled="s.status !== 'online'" :data-test="`ipcheck-${s.name}`" @click="ipcheck = s"><Icon name="nodes" />IP 质量与解锁</button>
                   <button type="button" :data-test="`edit-server-${s.name}`" @click="openEdit(s)"><Icon name="edit" />备注</button>
@@ -272,7 +275,7 @@ const counts = computed(() => ({
     <div class="dialog-body">
       <div class="field">
         <label>域名</label>
-        <input v-model="dns.name" class="input mono" placeholder="n1.myroom.asia" data-test="dns-name" @keydown.enter.prevent="saveDns">
+        <input v-model="dns.name" class="input mono" placeholder="n1.example.com" data-test="dns-name" @keydown.enter.prevent="saveDns">
         <div class="help">要在 Cloudflare 管理的域名下，并设置 Worker 密钥 CF_DNS_TOKEN（权限：区域 · DNS · 编辑）。留空关闭。不要用带 vpn 的名字。</div>
       </div>
       <div v-if="dns.error" class="notice err">{{ dns.error }}</div>
@@ -300,7 +303,7 @@ const counts = computed(() => ({
   </Modal>
 
   <!-- add a server -->
-  <Modal v-if="add.open" title="添加服务器" subtitle="添加后会给出一键命令：在服务器上以 root 执行，安装 PSM（已有也可以）和 psm-agent 并接入面板。" size="narrow" @close="add.open = false">
+  <Modal v-if="add.open" title="添加服务器" subtitle="添加后会给出一条一键命令：在服务器上以 root 执行，它会装好需要的组件并接入面板（服务器上已有 PSM 也可以）。" size="narrow" @close="add.open = false">
     <form class="dialog-body" @submit.prevent="submitAdd">
       <div v-if="add.error" class="errors">{{ add.error }}</div>
       <div class="field">
@@ -354,7 +357,7 @@ const counts = computed(() => ({
       </p>
       <dl v-if="diag.report" class="facts">
         <dt>PSM 版本</dt><dd>{{ diag.report.psm_version || '—' }}</dd>
-        <dt>psm-agent</dt><dd>{{ diag.report.agent_version || '—' }}</dd>
+        <dt>服务器组件</dt><dd>{{ diag.report.agent_version || '—' }}</dd>
         <dt>内核</dt>
         <dd data-test="diag-cores">
           <span v-for="c in diag.report.cores ?? []" :key="c.core" class="label-chip">

@@ -12,7 +12,7 @@ E2E_MOCK_PORT="$MOCK_PORT" node "$E2E/mock.mjs" & mock=$!
 ( cd "$PANEL" && NO_BUNDLE=1 npm run build >/dev/null 2>&1 && exec npx wrangler dev --local --port "$PORT" --persist-to "$E2E/state" --test-scheduled \
     --var ADMIN_PASSWORD:roomkey-e2e-pass --var ADMIN_USERNAME:Admin-e2e --var SYNC_INTERVAL:5 \
     --var CF_DNS_TOKEN:cf-test-token --var CF_ZONE_ID:zone1 --var "CF_API_BASE:http://127.0.0.1:$MOCK_PORT" --var "TELEGRAM_API_BASE:http://127.0.0.1:$MOCK_PORT" \
-    --var ADMIN_HOSTS:localhost --var INSTALL_URL:https://raw.githubusercontent.com/example/roomkey-stack/main/bootstrap.sh --var PSM_REPO:https://github.com/example/roomkey-stack ) > "$E2E/wrangler.log" 2>&1 &
+    --var ADMIN_HOSTS:localhost --var "UPDATE_BASE:http://127.0.0.1:$MOCK_PORT/__release" --var CF_UPDATE_TOKEN:upd-token --var CF_ACCOUNT_ID:acc1 --var WORKER_NAME:roomkey-test --var INSTALL_URL:https://raw.githubusercontent.com/example/roomkey-stack/main/bootstrap.sh --var PSM_REPO:https://github.com/example/roomkey-stack ) > "$E2E/wrangler.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 90); do grep -q "Ready on" "$E2E/wrangler.log" 2>/dev/null && break; sleep 1; done
 BASE="http://localhost:$PORT" E2E_MOCK_PORT="$MOCK_PORT" node "$E2E/e2e.mjs"; rc=$?

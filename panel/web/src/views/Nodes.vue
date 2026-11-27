@@ -104,7 +104,7 @@ const pct = (n: PanelNode) => (n.traffic_limit_gb > 0 ? Math.min(100, (n.traffic
 
 <template>
   <div class="page-head">
-    <div><h1>节点管理</h1><p>节点由各服务器上的 psm-agent 建好；这里的修改几秒内生效。</p></div>
+    <div><h1>节点管理</h1><p>新建和修改几秒内同步到服务器。</p></div>
     <div class="page-actions">
       <button class="btn primary" data-test="new-node" @click="openNew"><Icon name="plus" />新建节点</button>
     </div>
@@ -129,9 +129,9 @@ const pct = (n: PanelNode) => (n.traffic_limit_gb > 0 ? Math.min(100, (n.traffic
       <span class="muted">{{ filtered ? `${shown.length} / ` : '' }}{{ nodes.length }} 个节点</span>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="cards">
         <thead>
-          <tr><th>节点</th><th>状态</th><th>协议</th><th>运行方式</th><th>服务器</th><th>地址</th><th>本月流量</th><th>标签</th><th class="actions">操作</th></tr>
+          <tr><th>节点</th><th>状态</th><th>协议</th><th>服务器</th><th>地址</th><th>本月流量</th><th>标签</th><th class="actions">操作</th></tr>
         </thead>
         <tbody>
           <template v-for="n in rows" :key="n.id">
@@ -147,12 +147,12 @@ const pct = (n: PanelNode) => (n.traffic_limit_gb > 0 ? Math.min(100, (n.traffic
               <span class="proto-tag"><span class="dot" :style="{ background: proto(n.protocol)?.color }" />
                 {{ proto(n.protocol)?.label }}<template v-if="(proto(n.protocol)?.variants.length ?? 0) > 1"> · {{ findVariant(n.protocol, n.variant)?.label }}</template>
               </span>
+              <span class="sub" title="运行方式">{{ ENGINE_LABELS[n.engine as Engine] ?? n.engine }}</span>
             </td>
-            <td>{{ ENGINE_LABELS[n.engine as Engine] ?? n.engine }}</td>
-            <td>{{ serverName(n.server_id) }}</td>
+            <td data-label="服务器">{{ serverName(n.server_id) }}</td>
             <td class="mono">{{ n.address }}:{{ n.public_port ?? n.port }}<span v-if="n.mount_443" class="badge info">443 复用</span></td>
-            <td>
-              <div class="small">{{ formatBytes(n.traffic_used) }} / {{ n.traffic_limit_gb ? `${n.traffic_limit_gb} GB` : '不限' }}</div>
+            <td data-label="本月流量">
+              <span class="small">{{ formatBytes(n.traffic_used) }} / {{ n.traffic_limit_gb ? `${n.traffic_limit_gb} GB` : '不限' }}</span>
               <div v-if="n.traffic_limit_gb" class="meter" style="margin-top: 3px"><span :class="{ over: pct(n) >= 80, full: pct(n) >= 100 }" :style="{ width: `${pct(n)}%` }" /></div>
             </td>
             <td><span v-for="l in n.labels" :key="l" class="label-chip">{{ l }}</span></td>
@@ -188,7 +188,7 @@ const pct = (n: PanelNode) => (n.traffic_limit_gb > 0 ? Math.min(100, (n.traffic
     </div>
   </div>
 
-  <NodeDialog v-if="dialog" :servers="servers" :node="editing" @close="dialog = false; load()" @created="load" />
+  <NodeDialog v-if="dialog" :servers="servers" :node="editing" :nodes="nodes" @close="dialog = false; load()" @created="load" />
   <Modal v-if="link" :title="`${link.node.name} 的${link.format === 'surge' ? ' Surge 配置行' : '链接'}`" @close="link = null">
     <div class="dialog-body">
       <SecretText :value="link.content" test="node-link" copied="已复制链接" />

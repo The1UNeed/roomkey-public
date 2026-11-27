@@ -1,0 +1,50 @@
+name: roomkey release
+
+# A tag vX.Y.Z (PANEL_VERSION in panel/worker/src/index.ts) publishes what a
+# running panel needs to update itself (panel/worker/src/updates.ts): the
+# panel's pages and Worker code, and the install bundle servers get PSM and
+# psm-agent from, built here from this commit. Panels with 自动更新 on install
+# it during their update window; servers follow.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: stack/agent/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+      - run: npm ci
+      - name: the tag names this version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n "s/^const PANEL_VERSION = '\(.*\)'/\1/p" worker/src/index.ts)
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME, but PANEL_VERSION is $have"; exit 1; }
+      - name: install bundle (PSM and psm-agent, built from this commit)
+        run: bash scripts/bundle.sh
+      - name: build
+        run: |
+          npm run build
+          npx wrangler deploy --dry-run --outdir ../dist-worker
+          node scripts/release-manifest.mjs ../dist-worker ../dist-release "$GITHUB_REF_NAME"
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" ../dist-release/* --latest --title "roomkey ${GITHUB_REF_NAME#v}" \
+            --notes "roomkey ${GITHUB_REF_NAME#v}: the panel (pages, Worker code) and the install bundle (PSM, psm-agent $(sed -n "s/^const AGENT_VERSION = '\(.*\)'/\1/p" worker/src/index.ts)). Panels with 自动更新 install it during their update window; the files are for that, not for downloading by hand."

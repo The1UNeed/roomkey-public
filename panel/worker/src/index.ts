@@ -12,13 +12,14 @@ import {
 } from './auth'
 import { buildSubscription, displayName, pickFormat, renamed, type SubNode } from './subscription'
 import { BUILTIN_TEMPLATES, FORMAT_LABELS, TEMPLATE_FORMATS, type TemplateFormat } from './templates'
-import { activeFields, currentVariant, findVariant, trafficTag, validateNode, type NodeInput } from '../../shared/protocols'
+import { activeFields, currentVariant, findVariant, isSiteDomain, trafficTag, validateNode, type NodeInput } from '../../shared/protocols'
+import { registerUpdateRoutes, updateCron, type UpdateDeps } from './updates'
 import { applyLeaveUsage, cron as roomkeyCron, onSync as roomkeySync, reconcileUsers, registerRoutes as registerRoomkey, userSubscription, userSyncResult, type Deps } from './roomkey'
 
 // not exported: every export of a Worker's main module is taken for an entrypoint
 // Shown in 系统设置 as 面板版本; bump it whenever the panel gains something, so
 // that it answers "did my deploy take effect?" — the only marker a user has.
-const PANEL_VERSION = '0.11.0-roomkey'
+const PANEL_VERSION = '0.12.1'
 /** A result the panel could not record (its node is failed; whether it ran on the server is unknown). */
 const UNRECORDED = '面板没能记录这个结果：'
 /** A create the server refused because the same node (or standalone server) is already there, not the panel's: never removed by the panel. */
@@ -27,7 +28,7 @@ const CONFLICT = '服务器上已有同名节点（不是面板建的），没�
 // The psm-agent release this panel expects its servers to run: the 服务器 page
 // offers an upgrade to every joined server reporting anything else. Bump it
 // together with the agent-v… release the panel's install command installs.
-const AGENT_VERSION = '0.14.0'
+const AGENT_VERSION = '0.15.0'
 
 export type Env = {
   DB: D1Database
@@ -54,6 +55,15 @@ export type Env = {
   ADMIN_HOSTS?: string
   /** the git repository servers install PSM (and psm-agent's release) from, passed to bootstrap.sh --repo */
   PSM_REPO?: string
+  /** updates: the GitHub repository releases come from (owner/name; default roomkey's public one) */
+  UPDATE_REPO?: string
+  /** tests only: a stand-in for https://github.com/<repo>/releases */
+  UPDATE_BASE?: string
+  /** the panel updating itself: a Cloudflare API token that can edit this Worker (Workers Scripts · Edit; secret) */
+  CF_UPDATE_TOKEN?: string
+  /** …this Worker's account and name */
+  CF_ACCOUNT_ID?: string
+  WORKER_NAME?: string
   /** tests only: stand-ins for Cloudflare's and Telegram's APIs */
   CF_API_BASE?: string
   TELEGRAM_API_BASE?: string
@@ -627,6 +637,23 @@ app.post('/api/servers/:id/check', async (c) => {
   return c.json({ status: 'queued' }, 202)
 })
 
+// ── 探测 / 扫描: whether sites work as a borrowed REALITY site, seen from the
+// server (psm reality probe). Read-only on the server; the answer comes back
+// on the task (GET /api/tasks/:id).
+app.post('/api/servers/:id/probe', async (c) => {
+  const s = await getServer(c.env, c.req.param('id'))
+  if (!s) return c.json(fail('not_found', 'no such server'), 404)
+  if (!s.agent_token_hash) return c.json(fail('not_joined', '服务器还没有接入面板：接入后才能从它那里探测'), 409)
+  if (!versionAtLeast(s.agent_version, BORROWED_AGENT))
+    return c.json(fail('agent_too_old', `${s.name} 的 psm-agent 是 ${s.agent_version ?? '旧版'}，探测要 ${BORROWED_AGENT} 以上：先在服务器页的 ⋯ 里升级 psm-agent`), 409)
+  const body = await c.req.json<{ hosts?: unknown }>().catch(() => ({} as { hosts?: unknown }))
+  const hosts = Array.isArray(body.hosts) ? [...new Set(body.hosts.map((h) => String(h).trim().toLowerCase()))] : []
+  if (!hosts.length || hosts.length > 12 || !hosts.every(isSiteDomain))
+    return c.json(fail('invalid', '要探测的网站：1-12 个域名，例如 www.samsung.com'), 400)
+  const id = await enqueue(c.env, s.id, null, { kind: 'reality.probe', data: { hosts } })
+  return c.json({ task_id: id }, 202)
+})
+
 app.get('/api/servers/:id/check', async (c) => {
   const s = await getServer(c.env, c.req.param('id'))
   if (!s) return c.json(fail('not_found', 'no such server'), 404)
@@ -905,12 +932,16 @@ const bankRetired = (env: Env, serverId: number) => env.DB.prepare(
     WHERE id IN (SELECT user_id FROM user_servers WHERE server_id = ?)`).bind(serverId, serverId)
 const PSM_PMTUD = '2026-10-07'
 const OWN_SITE_AGENT = '0.14.0'
+// a borrowed REALITY site and the 探测 / 扫描 buttons came with psm-agent 0.15.0
+const BORROWED_AGENT = '0.15.0'
 // REALITY's own site goes only to roomkey's psm-agent, which checks that its
 // PSM says it supports it (psm caps) and reads back what PSM stored. A server
 // that has not joined yet is checked when it joins.
 function psmTooOld(s: ServerRow, data: Record<string, unknown>): string | null {
   if (data.own_site === true && s.agent_token_hash && !versionAtLeast(s.agent_version, OWN_SITE_AGENT))
     return `${s.name} 的 psm-agent 是 ${s.agent_version ?? '旧版'}，不支持 REALITY 本机站点：先在服务器页的 ⋯ 里升级 psm-agent（会先更新 PSM），再保存`
+  if (data.borrowed_site === true && s.agent_token_hash && !versionAtLeast(s.agent_version, BORROWED_AGENT))
+    return `${s.name} 的 psm-agent 是 ${s.agent_version ?? '旧版'}，不支持借用其他网站：先在服务器页的 ⋯ 里升级 psm-agent（会先更新 PSM），再保存`
   const d = /^(\d{4}-\d{2}-\d{2})\b/.exec(s.psm_version ?? '')?.[1]
   if (!d) return null   // not joined yet: it installs the current PSM
   if (data.disable_pmtud === true && d < PSM_PMTUD)
@@ -1459,6 +1490,11 @@ async function applyResult(env: Env, server: ServerRow, t: TaskRow, r: AgentResu
           .bind(await encrypt(env.TOKEN_KEY, report.slice(0, 512 * 1024)), typeof version === 'string' ? version.slice(0, 40) : null, server.id).run()
       }
       return
+    case 'reality.probe':
+      if (r.ok && r.output && typeof r.output === 'object')
+        await db.prepare('UPDATE tasks SET result_enc = ? WHERE id = ?')
+          .bind(await encrypt(env.TOKEN_KEY, JSON.stringify(r.output).slice(0, 64 * 1024)), t.id).run()
+      return
     case 'check.run':
       if (r.ok && r.output && typeof r.output === 'object') {
         await db.prepare(`UPDATE servers SET check_enc = ?, check_at = datetime('now'), check_error = NULL WHERE id = ?`)
@@ -1786,6 +1822,8 @@ const deps: Deps = {
   },
 }
 registerRoomkey(app, deps)
+const updateDeps: UpdateDeps = { audit, enqueue, fail, versionAtLeast, panelVersion: PANEL_VERSION, agentVersion: AGENT_VERSION }
+registerUpdateRoutes(app, updateDeps)
 
 app.all('/api/*', (c) => c.json(fail('not_found', 'no such endpoint'), 404))
 // everything else is the panel's pages (the Worker runs first for every path,
@@ -1804,6 +1842,7 @@ export default {
       if (!env.TOKEN_KEY) env.TOKEN_KEY = panelKey ??= await storedTokenKey(env.DB)
       await housekeeping(env).catch((e) => console.error('housekeeping', e))
       await roomkeyCron(env, deps).catch((e) => console.error('roomkey cron', e))
+      await updateCron(env, updateDeps).catch((e) => console.error('update cron', e))
     })())
   },
 } satisfies ExportedHandler<Env>

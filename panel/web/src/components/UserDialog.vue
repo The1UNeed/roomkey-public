@@ -3,11 +3,12 @@
 // which nodes they get. Quotas can be a total over every server, a limit on
 // some servers, or both — whichever runs out first pauses them (everywhere, or
 // on that server only).
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { api, beijingDate, errorText, GB, type PanelNode, type PanelUser, type Server, type UserAccess } from '../api'
 import { userNodes } from '@shared/users'
 import { toast } from '../ui'
 import Modal from './Modal.vue'
+import ComboBox, { type ComboOption } from './ComboBox.vue'
 
 const props = defineProps<{ user?: PanelUser | null; servers: Server[]; nodes: PanelNode[] }>()
 const emit = defineEmits<{ close: []; saved: [PanelUser] }>()
@@ -28,7 +29,7 @@ const form = reactive({
   quota: gb(u?.quota_total_bytes) as number | string,
   period: u?.reset_period ?? 'monthly',
   resetDay: (u?.reset_day ?? 1) as number | string,
-  devices: (u?.device_limit ?? 0) as number | string,
+  devices: (u?.device_limit || '') as number | string,
   unmetered: u?.unmetered ?? false,
   access: accessMode(u?.access) as 'all' | 'label' | 'node',
   labels: (u?.access ?? []).filter((a) => a.kind === 'label').map((a) => a.value),
@@ -38,9 +39,17 @@ const form = reactive({
 })
 const showServers = ref(Object.keys(form.perServer).length > 0)
 const errors = ref<string[]>([])
+// errors sit at the top of the form: brought into view when they appear
+const body = ref<HTMLElement | null>(null)
+watch(errors, (e) => { if (e.length && body.value) body.value.scrollTop = 0 })
 const busy = ref(false)
 
 const allLabels = computed(() => [...new Set(props.nodes.flatMap((n) => n.labels))].sort())
+// the same traffic presets as a node's (typing another number stays possible)
+const QUOTAS: ComboOption[] = [{ value: '0', label: '不限', note: '0' }, { value: '50', label: '50 GB' }, { value: '100', label: '100 GB' },
+  { value: '200', label: '200 GB' }, { value: '500', label: '500 GB' }, { value: '1000', label: '1 TB' }]
+const labelOptions = computed<ComboOption[]>(() => allLabels.value.filter((l) => !form.labels.includes(l))
+  .map((l) => ({ value: l, note: `${props.nodes.filter((n) => n.labels.includes(l)).length} 个节点` })))
 const serverName = (id: number) => props.servers.find((s) => s.id === id)?.name ?? `#${id}`
 // what the user would get, by the same rules the panel applies (shared/users.ts)
 const accessList = computed<UserAccess[]>(() => form.access === 'all' ? [{ kind: 'all', value: '' }]
@@ -59,6 +68,9 @@ function addLabel(l = form.labelDraft.trim()) {
   if (l && !form.labels.includes(l)) form.labels.push(l)
   form.labelDraft = ''
 }
+// weekly days are 1–7: a monthly day past that would show as nothing
+watch(() => form.period, (p) => { if (p === 'weekly' && Number(form.resetDay) > 7) form.resetDay = 1 })
+
 function toggleNode(id: number) {
   form.nodeIds = form.nodeIds.includes(id) ? form.nodeIds.filter((x) => x !== id) : [...form.nodeIds, id]
 }
@@ -95,7 +107,7 @@ async function save() {
 <template>
   <Modal :title="editing ? `编辑用户 ${u!.name}` : '新建用户'" size="wide" sticky @close="emit('close')">
     <template #subtitle><p>用户在每台分到节点的服务器上都用同一套 UUID 和密码。改动保存后几秒内下发到服务器。</p></template>
-    <div class="dialog-body">
+    <div ref="body" class="dialog-body">
       <ul v-if="errors.length" class="errors" data-test="user-errors"><li v-for="e in errors" :key="e">{{ e }}</li></ul>
 
       <div class="row2">
@@ -136,7 +148,7 @@ async function save() {
       <div class="row3">
         <div class="field">
           <label>总流量（GB）</label>
-          <input v-model="form.quota" class="input" type="number" min="0" step="any" placeholder="不限" data-test="user-quota">
+          <ComboBox v-model="form.quota" :options="QUOTAS" type="number" placeholder="不限" test="user-quota" />
           <div class="help">所有服务器加起来。</div>
         </div>
         <div class="field">
@@ -150,7 +162,9 @@ async function save() {
           <select v-if="form.period === 'weekly'" v-model.number="form.resetDay" class="select">
             <option v-for="(d, i) in ['周一', '周二', '周三', '周四', '周五', '周六', '周日']" :key="i" :value="i + 1">{{ d }}</option>
           </select>
-          <input v-else v-model="form.resetDay" class="input" type="number" min="1" max="28" data-test="user-reset-day">
+          <select v-else v-model.number="form.resetDay" class="select" data-test="user-reset-day">
+            <option v-for="d in 28" :key="d" :value="d">每月 {{ d }} 日</option>
+          </select>
         </div>
       </div>
       <div v-if="periodMoved" class="notice warn small">改了重置周期：保存后从现在开始一个新周期，本周期已用的流量清零。</div>
@@ -174,10 +188,11 @@ async function save() {
             {{ m === 'all' ? '全部节点' : m === 'label' ? '按标签' : '指定节点' }}
           </button>
         </div>
-        <div v-if="form.access === 'label'" class="chips" style="margin-top: 8px">
-          <span v-for="l in form.labels" :key="l" class="chip">{{ l }}<button type="button" @click="form.labels = form.labels.filter((x) => x !== l)">×</button></span>
-          <input v-model="form.labelDraft" list="user-labels" placeholder="输入标签后回车" @keydown.enter.prevent="addLabel()">
-          <datalist id="user-labels"><option v-for="l in allLabels" :key="l" :value="l" /></datalist>
+        <div v-if="form.access === 'label'" style="margin-top: 8px">
+          <div v-if="form.labels.length" class="chips" style="margin-bottom: 6px">
+            <span v-for="l in form.labels" :key="l" class="chip">{{ l }}<button type="button" :aria-label="`去掉 ${l}`" @click="form.labels = form.labels.filter((x) => x !== l)">×</button></span>
+          </div>
+          <ComboBox v-model="form.labelDraft" :options="labelOptions" placeholder="选择节点标签，或输入后回车" test="user-label" @pick="addLabel" @keydown.enter.prevent="addLabel()" />
         </div>
         <div v-if="form.access === 'node'" class="node-pick">
           <label v-for="n in nodes" :key="n.id" class="check">
@@ -200,8 +215,7 @@ async function save() {
           <input v-model="form.devices" class="input" type="number" min="0" max="100" placeholder="不限" data-test="user-devices">
           <div class="help">超出时暂停 15 分钟。只统计 Xray 节点；挂在共享 443 上的节点看不到真实 IP，不计入。暂停和恢复都会重启这个用户所在服务器的内核，其他人的连接会断一下：多数朋友留空（不限）即可。</div>
         </div>
-        <div class="field">
-          <label>&nbsp;</label>
+        <div class="field enabled-field">
           <label class="check"><input v-model="form.enabled" type="checkbox" data-test="user-enabled"> 启用</label>
         </div>
       </div>
@@ -217,6 +231,8 @@ async function save() {
 </template>
 
 <style scoped>
+/* lined up with the input beside it on a wide screen; right under it on a phone */
+@media (min-width: 641px) { .enabled-field { padding-top: 30px } }
 .per-server { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px }
 .per-server-row { display: grid; grid-template-columns: minmax(80px, 1fr) 140px auto; align-items: center; gap: 10px; margin-bottom: 6px }
 .per-server-row .input { padding: 5px 8px }

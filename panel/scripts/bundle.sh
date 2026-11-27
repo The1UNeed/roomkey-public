@@ -50,5 +50,8 @@ fi
 ( cd "$OUT"
   if command -v sha256sum >/dev/null 2>&1; then sha256sum stack.tgz psm-agent-linux-* > SHA256SUMS
   else shasum -a 256 stack.tgz psm-agent-linux-* > SHA256SUMS; fi )
+# the PSM version servers report once they run this bundle (the panel's
+# updater compares it with what each server reports)
+cp "$tmp/.psm-version" "$OUT/VERSION"
 echo "bundle: $(git -C "$ROOT" log -1 --format='%h %cs') → $OUT"
 cat "$OUT/SHA256SUMS"

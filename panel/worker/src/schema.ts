@@ -21,6 +21,7 @@ import m0015 from '../../migrations/0015_display_name.sql'
 import m0016 from '../../migrations/0016_users.sql'
 import m0017 from '../../migrations/0017_user_sync.sql'
 import m0018 from '../../migrations/0018_owned_no_relays.sql'
+import m0019 from '../../migrations/0019_update_tried.sql'
 
 const MIGRATIONS: [name: string, sql: string][] = [
   ['0001_init.sql', m0001],
@@ -41,6 +42,7 @@ const MIGRATIONS: [name: string, sql: string][] = [
   ['0016_users.sql', m0016],
   ['0017_user_sync.sql', m0017],
   ['0018_owned_no_relays.sql', m0018],
+  ['0019_update_tried.sql', m0019],
 ]
 
 /** The database is psm-panel's: roomkey refuses to run on it (see migrate). */

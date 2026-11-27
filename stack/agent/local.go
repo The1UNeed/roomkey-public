@@ -702,14 +702,34 @@ func (a *agent) capsHave(ctx context.Context, cap string) bool {
 	return a.caps[cap]
 }
 
-// ownSiteReady: REALITY (and REALITY under XHTTP / gRPC) is only ever made on
-// this server's own site — a task without own_site, an old one queued before,
-// is refused — and only on a PSM that sets that site up and refuses any other
-// fallback when a core starts.
+// ownSiteReady: REALITY (and REALITY under XHTTP / gRPC) is made on this
+// server's own site, or on one site its owner borrowed on purpose
+// (borrowed_site: the panel's 借用其他网站, ticked with its risk): a domain on
+// port 443 that is the node's SNI, never an address, another port or this
+// server's network. A task with neither (an old one queued before) is refused,
+// and each goes only to a PSM that sets it up and whose core guard lets
+// exactly that through.
 func (a *agent) ownSiteReady(ctx context.Context, proto string, data map[string]any) string {
 	reality := proto == "reality" || (proto == "xhttp" && data["mode"] == "reality-layer")
+	if reality && data["borrowed_site"] == true {
+		if data["own_site"] == true {
+			return "borrowed_site and own_site: choose one camouflage"
+		}
+		sn, _ := data["server_name"].(string)
+		sn = strings.ToLower(sn)
+		if !borrowedSiteRe.MatchString(sn) {
+			return fmt.Sprintf("a borrowed site is a domain (www.samsung.com, say), not %q", sn)
+		}
+		if d, _ := data["dest"].(string); d != "" && strings.ToLower(d) != sn+":443" {
+			return fmt.Sprintf("a borrowed site's target is %s:443, not %q", sn, d)
+		}
+		if !a.capsHave(ctx, "reality.borrowed") || !a.capsHave(ctx, "reality.guard") {
+			return "this server's PSM does not support borrowed REALITY sites: update PSM (psm agent upgrade)"
+		}
+		return ""
+	}
 	if reality && data["own_site"] != true {
-		return "REALITY is only made on this server's own site (own_site): a third-party fallback would make the server an open relay"
+		return "REALITY is only made on this server's own site (own_site) or a site borrowed on purpose (borrowed_site)"
 	}
 	if data["own_site"] != true {
 		return ""
@@ -723,22 +743,42 @@ func (a *agent) ownSiteReady(ctx context.Context, proto string, data map[string]
 	return ""
 }
 
-// ownSiteHolds checks what PSM stored for an own-site node: its fallback must
-// be this server's site.
-func (a *agent) ownSiteHolds(ctx context.Context, core, proto, tag string) string {
+// a borrowed site: a DNS name with a letter TLD (no IP literal, no port)
+var borrowedSiteRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
+
+// ownSiteHolds checks what PSM stored for an own-site node (its fallback must
+// be this server's site) or a borrowed one (exactly the borrowed site on 443).
+func (a *agent) ownSiteHolds(ctx context.Context, core, proto, tag string, borrowed string) string {
 	var show struct {
 		Item struct {
 			Node struct {
-				Dest    string `json:"dest"`
-				OwnSite bool   `json:"own_site"`
+				Dest     string `json:"dest"`
+				OwnSite  bool   `json:"own_site"`
+				Borrowed bool   `json:"borrowed_site"`
 			} `json:"node"`
 		} `json:"item"`
 	}
 	if err := json.Unmarshal(a.jsonPart(ctx, "node", "show", core, proto, tag, "--json"), &show); err != nil {
 		return "could not read back the node from PSM"
 	}
-	if show.Item.Node.Dest != "127.0.0.1:8443" || !show.Item.Node.OwnSite {
-		return fmt.Sprintf("PSM stored REALITY with fallback %q, not this server's own site: the node was removed", show.Item.Node.Dest)
+	n := show.Item.Node
+	if borrowed != "" {
+		if !n.Borrowed || n.OwnSite || strings.ToLower(n.Dest) != borrowed+":443" {
+			return fmt.Sprintf("PSM stored REALITY with fallback %q, not the borrowed site %s:443", n.Dest, borrowed)
+		}
+		return ""
+	}
+	if n.Dest != "127.0.0.1:8443" || !n.OwnSite {
+		return fmt.Sprintf("PSM stored REALITY with fallback %q, not this server's own site: the node was removed", n.Dest)
 	}
 	return ""
+}
+
+// borrowedOf: the borrowed site a node's data names, or "" (own site, or not REALITY)
+func borrowedOf(data map[string]any) string {
+	if data["borrowed_site"] != true {
+		return ""
+	}
+	sn, _ := data["server_name"].(string)
+	return strings.ToLower(sn)
 }

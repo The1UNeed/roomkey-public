@@ -17,9 +17,16 @@ type Overview = {
   reset_days: number[]
 }
 const o = ref<Overview | null>(null)
+// what is waiting to be updated (系统设置 → 更新): a note, not a problem
+const updates = ref<{ panel: { newer: boolean; latest: { version: string } | null }; servers: { name: string }[] } | null>(null)
 async function load() {
   try { o.value = await api<Overview>('/api/overview') } catch (e) { toast(errorText(e), 'err') }
+  updates.value = await api<typeof updates.value>('/api/updates').catch(() => null)
 }
+const notes = computed(() => [
+  ...(updates.value?.panel.newer && updates.value.panel.latest ? [`面板有新版本 ${updates.value.panel.latest.version}`] : []),
+  ...(updates.value?.servers.length ? [`${updates.value.servers.length} 台服务器可更新：${updates.value.servers.map((s) => s.name).join('、')}`] : []),
+])
 onMounted(load)
 usePoll(load, 30000)
 
@@ -74,8 +81,12 @@ const lastMonthShown = computed(() => !!since.value && (o.value?.daily ?? []).so
         <BarChart :daily="o.daily" :days="14" :since="since" test="dash-chart" />
       </div>
       <div class="card">
-        <div class="card-head"><h2>需要处理</h2><span class="muted">{{ o.problems.length ? `${o.problems.length} 项` : '' }}</span></div>
-        <ul v-if="o.problems.length" class="list-plain" data-test="problems">
+        <div class="card-head"><h2>需要处理</h2><span class="muted">{{ o.problems.length + notes.length ? `${o.problems.length + notes.length} 项` : '' }}</span></div>
+        <ul v-if="o.problems.length || notes.length" class="list-plain" data-test="problems">
+          <li v-for="n in notes" :key="n" data-test="update-note">
+            <span class="badge accent" style="margin: 0">更新</span>
+            <a href="#/settings"><b>{{ n }}</b></a>
+          </li>
           <li v-for="p in o.problems" :key="`${p.type}-${p.id}`">
             <span class="badge err" style="margin: 0">节点</span>
             <a :href="p.type === 'node' ? '#/nodes' : '#/audit'"><b>{{ p.server }}/{{ p.name }}</b></a>

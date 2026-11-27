@@ -4,6 +4,7 @@ import { api, errorText } from '../api'
 import { confirmAction, toast } from '../ui'
 import SecretText from '../components/SecretText.vue'
 import Icon from '../components/Icon.vue'
+import UpdatesCard from '../components/UpdatesCard.vue'
 
 type Settings = {
   version: string; agent_version: string; panel_url: string; effective_panel_url: string; sync_interval: number
@@ -67,7 +68,7 @@ const urlHint = computed(() => {
   const u = panelUrl.value.trim()
   if (!u || u.startsWith('https://')) return ''
   return /^http:\/\/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|[^./:]+(:|$))/.test(u)
-    ? 'http:// 只适合本机或内网的测试面板' : '要用 https://：节点的密钥和 agent 的令牌经这个地址传输'
+    ? 'http:// 只适合本机或内网的测试面板' : '要用 https://：节点的密钥和服务器的令牌经这个地址传输'
 })
 async function saveUrl() {
   urlError.value = ''
@@ -145,13 +146,16 @@ async function signOutEverywhere() {
     <div><h1>系统设置</h1></div>
   </div>
 
+  <!-- updates first: what this page is visited for most -->
+  <UpdatesCard v-if="settings" />
+
   <div v-if="settings" class="grid-2 section">
     <div class="card card-pad">
       <form class="field" style="margin: 0" @submit.prevent="saveUrl">
         <label>面板地址</label>
         <div class="cmd">
           <input v-model="panelUrl" class="input" :placeholder="settings.effective_panel_url" data-test="panel-url">
-          <button class="btn primary" type="submit" data-test="save-settings">保存</button>
+          <button class="btn primary" type="submit" :disabled="panelUrl.trim() === (settings.panel_url ?? '')" data-test="save-settings">保存</button>
         </div>
         <div v-if="urlError" class="error-text" data-test="panel-url-error">{{ urlError }}</div>
         <div v-else-if="urlHint" class="help" style="color: var(--warn)">{{ urlHint }}</div>
@@ -160,8 +164,6 @@ async function signOutEverywhere() {
     </div>
     <div class="card card-pad">
       <dl class="facts">
-        <dt>面板版本</dt><dd data-test="panel-version">{{ settings.version }}</dd>
-        <dt>psm-agent</dt><dd>{{ settings.agent_version }}（服务器页可一键升级）</dd>
         <dt>同步间隔</dt><dd>空闲时每 {{ settings.sync_interval }} 秒，有任务时每 3 秒</dd>
         <dt>源代码</dt><dd><a href="https://github.com/The1UNeed/roomkey-public" target="_blank" rel="noopener noreferrer">github.com/The1UNeed/roomkey-public</a>（基于 <a href="https://github.com/jinqians/proxy-stack" target="_blank" rel="noopener noreferrer">PSM</a>）</dd>
       </dl>
@@ -217,7 +219,7 @@ async function signOutEverywhere() {
         </div>
         <div v-if="ipKeysError" class="error-text">{{ ipKeysError }}</div>
         <div class="help">不填也能检测。填了免费 Key，服务器页的「IP 质量与解锁」会多这几家的风险分和风险因子。Key 加密保存，检测时经标准输入交给服务器。</div>
-        <div><button class="btn primary" type="submit" data-test="save-ipcheck-keys">保存</button></div>
+        <div><button class="btn primary" type="submit" :disabled="!Object.values(ipKeys).some((v) => v.trim())" data-test="save-ipcheck-keys">保存</button></div>
       </form>
     </div>
     <div v-if="rk" class="card card-pad" data-test="telegram">
@@ -231,7 +233,7 @@ async function signOutEverywhere() {
         <div v-if="tg.error" class="error-text">{{ tg.error }}</div>
         <div class="help">服务器离线和恢复、用户流量用完 / 过期 / 设备超限、有人登录本机页面时发消息。先给机器人发一条消息，它才能给你发。</div>
         <div class="hstack">
-          <button class="btn primary" type="submit" :disabled="tg.busy" data-test="tg-save">保存</button>
+          <button class="btn primary" type="submit" :disabled="tg.busy || (!tg.token && tg.chat === rk.telegram_chat)" data-test="tg-save">保存</button>
           <button v-if="rk.telegram_token_set" class="btn" type="button" data-test="tg-test" @click="testTelegram">发测试消息</button>
           <button v-if="rk.telegram_token_set" class="link-btn" type="button" @click="saveTelegram(true)">关闭</button>
         </div>
@@ -242,20 +244,20 @@ async function signOutEverywhere() {
       <p class="muted" style="margin: 0">
         <span class="status" :class="rk.install_ready ? 'ok' : 'err'"><span class="dot" />{{ rk.install_ready ? 'INSTALL_URL 已设置' : '没有设置 INSTALL_URL：安装命令不可用' }}</span><br>
         <span class="status" :class="rk.admin_hosts.length ? 'ok' : 'pending'"><span class="dot" />{{ rk.admin_hosts.length ? `后台只在 ${rk.admin_hosts.join('、')} 上开放` : '没有设置 ADMIN_HOSTS：后台在每个域名上都能打开' }}</span><br>
-        服务器从 INSTALL_URL / PSM_REPO 安装 roomkey 版的 PSM 和 psm-agent（见 docs/DEPLOY.md 第 0 步）。订阅域名只提供订阅和 psm-agent 的接口。
+        新服务器用安装命令从 INSTALL_URL / PSM_REPO 装上 roomkey 版的 PSM 和服务器组件；部署脚本会自动设好这两个变量。订阅域名只提供订阅和服务器接入的接口。
       </p>
     </div>
     <div v-if="rk" class="card card-pad">
       <div class="field-label">域名跟随 IP</div>
       <p class="muted" style="margin: 0">
         <span class="status" :class="rk.dns_token_set ? 'ok' : 'pending'"><span class="dot" />{{ rk.dns_token_set ? 'CF_DNS_TOKEN 已设置' : '没有设置 CF_DNS_TOKEN' }}</span><br>
-        在「服务器 → ⋯ → 域名跟随 IP」给每台服务器设一个域名，面板会在它换 IP 后自动改 DNS。需要 Worker 密钥 <code>CF_DNS_TOKEN</code>：Cloudflare API 令牌，权限「区域 · DNS · 编辑」，只给 myroom.asia 这一个区域；再设变量 <code>CF_ZONE_ID</code>{{ rk.dns_zone_set ? '（已设置）' : '' }}，或者给令牌加上「区域 · 区域 · 读取」让面板自己找。
+        在「服务器 → ⋯ → 域名跟随 IP」给每台服务器设一个域名，面板会在它换 IP 后自动改 DNS。需要 Worker 密钥 <code>CF_DNS_TOKEN</code>：Cloudflare API 令牌，权限「区域 · DNS · 编辑」，只给服务器用的那一个域名（区域）；再设变量 <code>CF_ZONE_ID</code>{{ rk.dns_zone_set ? '（已设置）' : '' }}，或者给令牌加上「区域 · 区域 · 读取」让面板自己找。
       </p>
     </div>
     <div class="card card-pad">
       <div class="field-label">备份</div>
-      <p class="muted" style="margin: 0 0 12px">导出服务器、节点、订阅、用户和设置，是可以直接恢复的 SQL（<code>wrangler d1 execute --file</code>，文件开头有步骤）。节点和用户的密钥仍是加密的，恢复时要用同一个 TOKEN_KEY（见上面「加密密钥」），请分开保存；流量历史和任务不在里面。Cloudflare D1 自带 Time Travel，也可以回到过去 7 天（免费版）或 30 天（付费版）内的任意时刻。</p>
-      <a class="btn" href="/api/backup" download data-test="backup"><Icon name="upload" />下载备份</a>
+      <p class="muted" style="margin: 0 0 12px">导出服务器、节点、订阅、用户和设置，是可以直接恢复的 SQL（<code>wrangler d1 execute --file</code>，文件开头有步骤）。节点和用户的密钥仍是加密的，恢复时要用同一个 TOKEN_KEY（见上面「数据加密密钥」），请分开保存；流量历史和任务不在里面。Cloudflare D1 自带 Time Travel，也可以回到过去 7 天（免费版）或 30 天（付费版）内的任意时刻。</p>
+      <a class="btn" href="/api/backup" download data-test="backup"><Icon name="download" />下载备份</a>
     </div>
     <div class="card card-pad">
       <div class="field-label">登录</div>
@@ -268,4 +270,5 @@ async function signOutEverywhere() {
 <style scoped>
 .ipk { display: grid; grid-template-columns: 120px minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 8px }
 .ipk-name { font-size: 13px }
+@media (max-width: 640px) { .ipk { grid-template-columns: minmax(0, 1fr) auto } .ipk-name { grid-column: 1 / -1 } }
 </style>

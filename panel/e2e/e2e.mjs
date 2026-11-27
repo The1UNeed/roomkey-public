@@ -28,10 +28,17 @@ let lastAcked = []
 const uids = new Map()   // task id → uid, as psm-agent echoes it in each result
 async function sync(body = {}, ip = '203.0.113.7') {
   if (Array.isArray(body.results)) body = { ...body, results: body.results.map((x) => ({ uid: uids.get(x.task_id), ...x })) }
-  const r = await fetch(PUBLIC + '/api/agent/sync', {
-    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${agentToken}`, 'CF-Connecting-IP': ip },
-    body: JSON.stringify({ agent_version: '0.14.0', hostname: 'hk1', psm_version: '2026-11-24 test', results: [], ...body }),
-  })
+  let r
+  // the panel allows 120 syncs a minute per agent: this fake one, much faster
+  // than psm-agent, waits like a real one would when told to slow down
+  for (let i = 0; ; i++) {
+    r = await fetch(PUBLIC + '/api/agent/sync', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${agentToken}`, 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ agent_version: '0.14.0', hostname: 'hk1', psm_version: '2026-11-24 test', results: [], ...body }),
+    })
+    if (r.status !== 429 || i >= 20) break
+    await new Promise((res) => setTimeout(res, 4000))
+  }
   const j = await r.json()
   for (const t of j.tasks ?? []) uids.set(t.id, t.uid)
   inbox.push(...(j.tasks ?? []))
@@ -507,6 +514,94 @@ ok((await admin('DELETE', `/api/users/${bob.data.id}`)).status === 204, 'bob del
 const lastList = await take('user.sync')
 ok(lastList && !lastList.data.users.some((u) => u.name === 'bob'), 'the next list no longer has bob')
 await took(lastList)
+
+// ── a borrowed REALITY site: the owner's choice, its risk ticked, its agent new enough ──
+const lent = (name, params, port = 8450) => admin('POST', '/api/nodes', { server_id: srv.data.id, protocol: 'vless', variant: 'vless-reality', engine: 'xray',
+  name, address: 'n1.myroom.asia', port, params: { camouflage: 'borrow', ...params } })
+const noRisk = await lent('hk-lent', { target: 'www.samsung.com' })
+ok(noRisk.status === 400 && /我知道风险/.test(JSON.stringify(noRisk.data)), 'a borrowed site needs its risk ticked', JSON.stringify(noRisk.data))
+for (const target of ['10.0.0.1', 'www.samsung.com:8443', 'localhost'])
+  ok((await lent('hk-lent', { target, accept_risk: true })).status === 400, `a borrowed site is a domain on 443 only (${target})`)
+const tooOld = await lent('hk-lent', { target: 'WWW.Samsung.com', accept_risk: true })
+ok(tooOld.status === 409 && /借用其他网站/.test(JSON.stringify(tooOld.data)), 'a psm-agent before 0.15.0 is not sent a borrowed site', JSON.stringify(tooOld.data))
+ok((await admin('POST', `/api/servers/${srv.data.id}/probe`, { hosts: ['www.amd.com'] })).status === 409, 'nor asked to probe')
+await sync({ agent_version: '0.15.0' })
+inbox.length = 0
+ok((await admin('POST', `/api/servers/${srv.data.id}/probe`, { hosts: ['www.amd.com', '10.0.0.1'] })).status === 400, 'a probe takes domains only')
+const probeQ = await admin('POST', `/api/servers/${srv.data.id}/probe`, { hosts: ['WWW.AMD.com', 'www.cloudflare.com'] })
+ok(probeQ.status === 202 && probeQ.data.task_id, 'a probe is queued for the server')
+const probeT = (await sync({ agent_version: '0.15.0' })).tasks.find((t) => t.kind === 'reality.probe')
+ok(probeT && JSON.stringify(probeT.data.hosts) === '["www.amd.com","www.cloudflare.com"]', 'the server is handed the sites, lower case', JSON.stringify(probeT?.data))
+const sites = [{ host: 'www.amd.com', ok: true, rtt_ms: 80, h2: true, shared_frontend: false }, { host: 'www.cloudflare.com', ok: true, rtt_ms: 5, h2: true, shared_frontend: true, shared_by: 'cdnjs.cloudflare.com' }]
+await sync({ agent_version: '0.15.0', results: [{ task_id: probeT.id, ok: true, output: { sites } }] })
+const probeR = await admin('GET', `/api/tasks/${probeQ.data.task_id}`)
+ok(probeR.data.status === 'done' && probeR.data.result.sites[1].shared_frontend === true, 'the probe\'s answer is on its task', JSON.stringify(probeR.data))
+const lentOk = await lent('hk-lent', { target: 'WWW.Samsung.com', accept_risk: true })
+ok(lentOk.status === 201, 'a borrowed site, risk ticked, on psm-agent 0.15.0', JSON.stringify(lentOk.data))
+const lentAdd = (await sync({ agent_version: '0.15.0' })).tasks.find((t) => t.kind === 'node.add' && t.data.tag === 'hk-lent')
+ok(lentAdd && lentAdd.data.borrowed_site === true && lentAdd.data.own_site === false && lentAdd.data.dest === 'www.samsung.com:443'
+  && lentAdd.data.server_name === 'www.samsung.com' && !('camouflage' in lentAdd.data) && !('target' in lentAdd.data) && !('accept_risk' in lentAdd.data),
+  'the server is sent borrowed_site, that site on 443 as its SNI, and none of the panel\'s own choices', JSON.stringify(lentAdd?.data))
+await sync({ agent_version: '0.15.0', results: [{ task_id: lentAdd.id, ok: true, link: `vless://${owner}@n1.myroom.asia:8450?security=reality&sni=www.samsung.com#L` }] })
+const lentRow = await admin('GET', `/api/nodes/${lentOk.data.id}`)
+ok(lentRow.data.params.camouflage === 'borrow' && lentRow.data.params.target === 'WWW.Samsung.com', 'the panel keeps the choice for the edit form', JSON.stringify(lentRow.data.params))
+// back to its own site: own_site, the loopback target, borrowed_site off
+ok((await admin('PATCH', `/api/nodes/${lentOk.data.id}`, { params: { camouflage: 'own', server_name: 'n1.myroom.asia' } })).status === 200, 'a borrowed node moved to its own site')
+const backOwn = (await sync({ agent_version: '0.15.0' })).tasks.find((t) => t.kind === 'node.update' && t.data.tag === 'hk-lent')
+ok(backOwn && backOwn.data.own_site === true && backOwn.data.borrowed_site === false && backOwn.data.dest === '127.0.0.1:8443', 'the update says own_site and borrowed_site off', JSON.stringify(backOwn?.data))
+await sync({ agent_version: '0.15.0', results: [{ task_id: backOwn.id, ok: true }] })
+inbox.length = 0
+
+// ── updates: a new release, installed in the update window, the panel first ──
+const cron = async () => { await fetch(`${BASE}/__scheduled?cron=*/5+*+*+*+*`); await new Promise((res) => setTimeout(res, 900)) }
+await sync()   // hk1 runs psm-agent 0.14.0 again: older than this panel's 0.15.0
+let up = (await admin('GET', '/api/updates')).data
+ok(up.panel.version === '0.12.1' && up.panel.latest?.version === '0.13.0' && up.panel.newer && up.panel.missing.length === 0 && !up.auto,
+  'the panel sees release 0.13.0, can update itself, and does not until asked', JSON.stringify(up.panel))
+ok(up.servers.some((s) => s.name === 'hk1' && s.online), 'hk1 is listed as out of date (psm-agent 0.14.0)', JSON.stringify(up.servers))
+for (const [w, why] of [[{ start: 3, end: 3, tz: 'UTC' }, 'the same hour twice'], [{ start: 3, end: 25, tz: 'UTC' }, 'hour 25'], [{ start: 3, end: 5, tz: 'Mars/Base' }, 'an unknown zone']])
+  ok((await admin('PUT', '/api/updates/settings', { window: w })).status === 400, `the update window refuses ${why}`)
+await cron()
+ok(!(await mockCalls()).some((x) => x.path.includes('/workers/')), 'nothing is updated while 自动更新 is off')
+const H = new Date().getUTCHours()
+up = (await admin('PUT', '/api/updates/settings', { auto: true, window: { start: (H + 23) % 24, end: (H + 2) % 24, tz: 'UTC' } })).data
+ok(up.auto && up.in_window, 'automatic updates on, in a window around now (UTC)', JSON.stringify({ auto: up.auto, w: up.window, h: up.local_hour }))
+await cron()
+let wcalls = (await mockCalls()).filter((x) => x.path.includes('/workers/'))
+const session = wcalls.find((x) => x.path.endsWith('/assets-upload-session'))
+ok(session && session.auth === 'Bearer upd-token' && session.body.manifest['/index.html'].hash === 'aa'.repeat(16) && session.body.manifest['/index.html'].size === 24,
+  'in the window the panel starts an asset upload session with the release\'s manifest, with its own token', JSON.stringify(session))
+const upload = wcalls.find((x) => x.path.startsWith('/accounts/acc1/workers/assets/upload'))
+ok(upload && upload.path.endsWith('?base64=true') && upload.auth === 'Bearer upload-jwt' && upload.body['aa'.repeat(16)].text === Buffer.from('<!doctype html>new panel').toString('base64'),
+  'each file Cloudflare asked for goes up, in base64, with the session\'s token', JSON.stringify(upload?.body))
+ok(!wcalls.some((x) => x.method === 'PUT'), 'the code is not replaced in the same step as the files')
+ok(!inbox.some((t) => t.kind === 'agent.update'), 'servers wait while the panel updates')
+await cron()
+wcalls = (await mockCalls()).filter((x) => x.path.includes('/workers/'))
+const put = wcalls.find((x) => x.method === 'PUT' && x.path === '/accounts/acc1/workers/scripts/roomkey-test')
+const meta = put && JSON.parse(put.body.metadata)
+ok(meta && meta.main_module === 'index.js' && meta.assets.jwt === 'completion-jwt' && meta.assets.config.run_worker_first === true
+  && JSON.stringify(meta.keep_bindings) === '["secret_text","secret_key"]' && !meta.bindings.some((b) => b.type === 'secret_text')
+  && meta.bindings.some((b) => b.type === 'd1' && b.id === 'd1-id') && meta.bindings.some((b) => b.type === 'plain_text' && b.text === 'admin.example')
+  && meta.placement?.mode === 'smart' && put.body['index.js']?.text === 'export default {}' && put.body['abc-0001_init.sql']?.type === 'text/plain',
+  'then the new code goes up: secrets kept by type, the other bindings and settings as they were, the uploaded files attached', JSON.stringify(meta))
+up = (await admin('GET', '/api/updates')).data
+ok(up.panel.job?.stage === 'done' && up.panel.job.version === '0.13.0', 'the update is recorded as done', JSON.stringify(up.panel.job))
+ok(!('jwt' in up.panel.job) && !('completion' in up.panel.job) && !JSON.stringify(up).includes('completion-jwt'), 'the page never sees the upload session\'s tokens')
+ok((await admin('GET', '/api/audit?action=panel.update')).data.some((a) => /0\.13\.0/.test(a.target ?? '') && /已更新/.test(a.detail ?? '')), 'and in the audit log')
+await cron()
+const updTask = await take('agent.update')
+ok(updTask, 'with the panel done, the window asks the out-of-date server to upgrade')
+ok((await mockCalls()).filter((x) => x.method === 'PUT').length === 1, 'a finished update is not run again by the old code still running')
+await sync({ results: [{ task_id: updTask.id, ok: true, output: { from: '0.14.0' } }] })
+await cron()
+ok(!(await take('agent.update')), 'each version is asked for once, not every five minutes while it installs')
+ok((await admin('POST', '/api/updates/servers')).data.asked === 1, '全部更新 asks again now, whatever was asked before')
+const updAgain = await take('agent.update')
+ok(updAgain, '…and the server is handed it')
+await sync({ results: [{ task_id: updAgain.id, ok: true, output: { from: '0.14.0' } }] })
+await admin('PUT', '/api/updates/settings', { auto: false })
+inbox.length = 0
 
 // ── removing the server: the panel's users go first, or the server stays ──
 const aliceList = lastList.data.users.find((u) => u.name === 'alice')

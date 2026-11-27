@@ -83,13 +83,14 @@ const total = computed(() => bars.value.reduce((a, b) => a + b.bytes, 0))
           <line v-for="t in ticks" :key="t" :x1="gutter" :x2="width" :y1="Math.round(y(t)) + 0.5" :y2="Math.round(y(t)) + 0.5" />
         </g>
         <g class="chart-axis">
-          <text v-for="t in ticks" :key="t" :x="gutter - 10" :y="y(t)" dy="0.32em" text-anchor="end">{{ byteTick(t) }}</text>
+          <text v-for="t in (total ? ticks : [0])" :key="t" :x="gutter - 10" :y="y(t)" dy="0.32em" text-anchor="end">{{ byteTick(t) }}</text>
           <text v-for="i in labels" :key="i" :x="cx(i)" :y="H - 6" text-anchor="middle">{{ bars[i].day.slice(5) }}</text>
         </g>
         <rect v-if="active !== null" class="chart-col" :x="cx(active) - slot / 2 + 1" :y="T" :width="Math.max(0, slot - 2)" :height="plotH" rx="4" />
         <path v-for="(b, i) in bars" :key="b.day" :d="barPath(b.bytes, i)" class="col-bar"
               :class="{ before: b.before, on: active === i }" :data-day="b.day" />
       </svg>
+      <div v-if="width && !total" class="chart-empty" data-test="chart-empty">这段时间还没有流量</div>
       <div v-if="tip" class="chart-tip" :style="tip.style" data-test="chart-tip">
         <b>{{ formatBytes(tip.b.bytes) }}</b>
         <div class="muted">{{ tip.b.day }} {{ tip.week }}</div>

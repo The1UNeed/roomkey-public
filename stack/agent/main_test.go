@@ -1055,3 +1055,97 @@ func TestAFirstCreateNeedsItsTagFreeOnEveryCore(t *testing.T) {
 		t.Fatalf("result: %+v", a.pending)
 	}
 }
+
+// A borrowed REALITY site: only with borrowed_site, only a domain on 443 that
+// is the node's SNI, only on a PSM that supports it, and what PSM stored is
+// read back.
+func TestBorrowedSiteIsExplicitAndReadBack(t *testing.T) {
+	caps := `{"caps":["reality.own_site","reality.guard","reality.borrowed","reality.probe"]}`
+	good := json.RawMessage(`{"tag":"hk","port":443,"server_name":"www.samsung.com","dest":"www.samsung.com:443","borrowed_site":true}`)
+	for i, bad := range []string{
+		`{"tag":"hk","port":443,"server_name":"192.0.2.1","dest":"192.0.2.1:443","borrowed_site":true}`,
+		`{"tag":"hk","port":443,"server_name":"www.samsung.com","dest":"10.0.0.1:80","borrowed_site":true}`,
+		`{"tag":"hk","port":443,"server_name":"www.samsung.com","dest":"www.samsung.com:8443","borrowed_site":true}`,
+		`{"tag":"hk","port":443,"server_name":"www.samsung.com","borrowed_site":true,"own_site":true}`,
+		`{"tag":"hk","port":443,"server_name":"www.samsung.com","dest":"www.samsung.com:443"}`,
+	} {
+		p := &fakePanel{tasks: []task{{ID: int64(i + 1), Kind: "node.add", Core: "xray", Protocol: "reality", Data: json.RawMessage(bad)}}}
+		f := &fakeRunner{stdout: map[string]string{"": caps}}
+		a, done := newTestAgent(t, p, f)
+		_, _ = a.step(context.Background())
+		_, _ = a.step(context.Background())
+		done()
+		if rs := results(t, p.requests[1]["results"]); rs[0].OK {
+			t.Fatalf("accepted %s", bad)
+		}
+		for _, c := range f.calls {
+			if len(c.args) > 1 && c.args[1] == "add" {
+				t.Fatalf("node add ran for %s", bad)
+			}
+		}
+	}
+	// a PSM without the capability
+	p := &fakePanel{tasks: []task{{ID: 9, Kind: "node.add", Core: "xray", Protocol: "reality", Data: good}}}
+	f := &fakeRunner{stdout: map[string]string{"": `{"caps":["reality.own_site","reality.guard"]}`}}
+	a, done := newTestAgent(t, p, f)
+	_, _ = a.step(context.Background())
+	_, _ = a.step(context.Background())
+	done()
+	if rs := results(t, p.requests[1]["results"]); rs[0].OK || !strings.Contains(rs[0].Error, "borrowed") {
+		t.Fatalf("old PSM: %+v", rs)
+	}
+	// stored with another fallback: taken down
+	p = &fakePanel{tasks: []task{{ID: 10, Kind: "node.add", Core: "xray", Protocol: "reality", Data: good}}}
+	f = &fakeRunner{stdout: map[string]string{"": caps, "add": `{"status":"created"}`,
+		"show": `{"item":{"node":{"dest":"www.apple.com:443","borrowed_site":true}}}`, "delete": `{"status":"deleted"}`}}
+	a, done = newTestAgent(t, p, f)
+	_, _ = a.step(context.Background())
+	_, _ = a.step(context.Background())
+	done()
+	if rs := results(t, p.requests[1]["results"]); rs[0].OK || !strings.Contains(rs[0].Error, "apple") {
+		t.Fatalf("bad stored fallback: %+v", rs)
+	}
+	// the good case
+	p = &fakePanel{tasks: []task{{ID: 11, Kind: "node.add", Core: "xray", Protocol: "reality", Data: good}}}
+	f = &fakeRunner{stdout: map[string]string{"": caps, "add": `{"status":"created"}`,
+		"show": `{"item":{"node":{"dest":"www.samsung.com:443","borrowed_site":true}}}`}}
+	a, done = newTestAgent(t, p, f)
+	defer done()
+	_, _ = a.step(context.Background())
+	_, _ = a.step(context.Background())
+	if rs := results(t, p.requests[1]["results"]); !rs[0].OK {
+		t.Fatalf("borrowed site: %+v", rs)
+	}
+}
+
+// The 探测 button: a domain only, passed to psm reality probe as one argument.
+func TestRealityProbe(t *testing.T) {
+	p := &fakePanel{tasks: []task{
+		{ID: 1, Kind: "reality.probe", Data: json.RawMessage(`{"host":"WWW.AMD.com"}`)},
+		{ID: 2, Kind: "reality.probe", Data: json.RawMessage(`{"host":"--json"}`)},
+		{ID: 3, Kind: "reality.probe", Data: json.RawMessage(`{"host":"10.0.0.1"}`)},
+		{ID: 4, Kind: "reality.probe", Data: json.RawMessage(`{"hosts":["www.amd.com","www.amd.com"]}`)},
+		{ID: 5, Kind: "reality.probe", Data: json.RawMessage(`{"hosts":["www.amd.com","a.b;rm -rf"]}`)},
+	}}
+	f := &fakeRunner{stdout: map[string]string{"": `{"caps":["reality.probe"]}`, "probe": `{"host":"www.amd.com","ok":true,"shared_frontend":false}`}}
+	a, done := newTestAgent(t, p, f)
+	defer done()
+	_, _ = a.step(context.Background())
+	_, _ = a.step(context.Background())
+	rs := results(t, p.requests[1]["results"])
+	if !rs[0].OK || !strings.Contains(string(rs[0].Output), `"sites":[{"host":"www.amd.com"`) || rs[1].OK || rs[2].OK || !rs[3].OK || rs[4].OK {
+		t.Fatalf("results: %+v", rs)
+	}
+	ran := 0
+	for _, c := range f.calls {
+		if len(c.args) > 1 && c.args[0] == "reality" {
+			ran++
+			if !reflect.DeepEqual(c.args, []string{"reality", "probe", "www.amd.com", "--json"}) {
+				t.Fatalf("probe args: %q", c.args)
+			}
+		}
+	}
+	if ran != 3 {
+		t.Fatalf("probes run: %d", ran)
+	}
+}

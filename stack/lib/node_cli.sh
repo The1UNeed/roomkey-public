@@ -469,6 +469,40 @@ _node_cli_own_site() {   # <core> <proto> <node> <store_only>
     printf '%s' "$node" | jq -c --arg sn "$sn" '.dest = "127.0.0.1:8443" | .server_names_raw = $sn | del(.limit_fallback)'
 }
 
+# REALITY on a borrowed site ("borrowed_site": true): the owner chose a
+# third-party site (www.samsung.com, say) on purpose, knowing that anyone
+# without the key is passed on to it. Only that one site: a domain, port 443,
+# the node's own SNI (dest follows server_name), so the fallback can never be
+# aimed at an address, a port or this server's network. A site on a shared CDN
+# frontend is not refused here, as it is without borrowed_site, but gets the
+# fallback speed limit (Xray, mihomo; sing-box has none) and a warning. The
+# core guard (psm_borrowed_sites) lets exactly this pair through.
+_node_cli_borrowed_site() {   # <core> <proto> <node> <store_only>
+    local core="$1" proto="$2" node="$3" store_only="$4" sn shared=false
+    if [[ "$proto" != reality ]] && ! [[ "$proto" == xhttp && "$(printf '%s' "$node" | jq -r '.mode // ""')" == reality-layer ]]; then
+        printf '%s' "$node"; return 0
+    fi
+    printf '%s' "$node" | jq -e '.borrowed_site == true' >/dev/null 2>&1 || { printf '%s' "$node"; return 0; }
+    if printf '%s' "$node" | jq -e '.own_site == true' >/dev/null 2>&1; then
+        _node_cli_err "borrowed_site and own_site: choose one camouflage"
+        return 1
+    fi
+    sn=$(printf '%s' "$node" | jq -r '.server_name // empty' | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$sn" ]] || ! is_domain "$sn" || [[ "$sn" =~ ^[0-9.]+$ ]]; then
+        _node_cli_err "borrowed_site: --server-name must be the borrowed site's domain (www.samsung.com, say), got '${sn}'"
+        return 1
+    fi
+    if [[ "$store_only" == "true" ]]; then
+        shared=$(printf '%s' "$node" | jq -r 'if .limit_fallback == true then "true" else "false" end')
+    elif reality_dest_is_shared_frontend "$sn" 443; then
+        shared=true
+        log_warn "borrowed site ${sn} is a shared CDN frontend (probe ${REALITY_DEST_SHARED_BY} got a valid certificate on the same IP): anyone without the key can reach the whole CDN through this server. The fallback is speed-limited$( [[ "$core" == sing-box ]] && printf ' on Xray and mihomo only (sing-box has no limit)')." >&2
+    fi
+    printf '%s' "$node" | jq -c --arg sn "$sn" --argjson lf "$shared" '
+        .server_name = $sn | .dest = ($sn + ":443") | .server_names_raw = $sn | .shared_frontend = $lf
+        | if $lf then .limit_fallback = true else del(.limit_fallback) end'
+}
+
 _node_cli_defaults() {
     local core="$1" proto="$2" json="$3" port method pair private public sid mode
     port=$(printf '%s' "$json" | jq -r '.port // empty')
@@ -501,7 +535,8 @@ _node_cli_defaults() {
             # A shared CDN frontend is refused, not rate limited: every connection
             # without the key would be passed on to the whole CDN, which is what
             # turns a server into an open relay (and gets it suspended).
-            if reality_dest_is_shared_frontend "$_dh" "$_dp"; then
+            if ! printf '%s' "$json" | jq -e '.borrowed_site == true' >/dev/null 2>&1 \
+                && reality_dest_is_shared_frontend "$_dh" "$_dp"; then
                 _node_cli_err "dest ${_dest} is a shared CDN frontend (probe ${REALITY_DEST_SHARED_BY} got a valid certificate on the same IP): anyone could relay through this server to the whole CDN. Use own_site (this node's own domain) or a single-tenant site"
                 return 1
             fi
@@ -614,7 +649,9 @@ _node_cli_defaults() {
                     _node_cli_err "XHTTP reality-layer camouflage target is required; pass --server-name (its dest is <server-name>:443 — pick a single-tenant site, ideally in your own ASN)"
                     return 1
                 fi
-                if ! reality_dest_is_local "$(printf '%s' "$json" | jq -r '.dest // ""')" && reality_dest_is_shared_frontend "$_xsn" 443; then
+                if ! reality_dest_is_local "$(printf '%s' "$json" | jq -r '.dest // ""')" \
+                    && ! printf '%s' "$json" | jq -e '.borrowed_site == true' >/dev/null 2>&1 \
+                    && reality_dest_is_shared_frontend "$_xsn" 443; then
                     _node_cli_err "server-name ${_xsn} is a shared CDN frontend (probe ${REALITY_DEST_SHARED_BY} got a valid certificate on the same IP): anyone could relay through this server to the whole CDN. Use own_site (this node's own domain) or a single-tenant site"
                     return 1
                 fi
@@ -1662,6 +1699,7 @@ _node_cli_cmd_add() {
         node=$(printf '%s' "$node" | jq -c '.vless_enc = "x25519"')
     fi
     node=$(_node_cli_own_site "$core" "$proto" "$node" "$store_only") || { _node_cli_lock_release; return 2; }
+    node=$(_node_cli_borrowed_site "$core" "$proto" "$node" "$store_only") || { _node_cli_lock_release; return 2; }
     node=$(_node_cli_defaults "$core" "$proto" "$node") || { _node_cli_lock_release; return 1; }
     if [[ "$store_only" != "true" ]]; then
         node=$(_node_cli_tls_auto "$core" "$proto" "$node") || { _node_cli_lock_release; return 2; }
@@ -1784,6 +1822,7 @@ _node_cli_cmd_update() {
         then $new | .server_names_raw = $new.server_name
         else $new end') || return 1
     node=$(_node_cli_own_site "$core" "$proto" "$node" "$(printf '%s' "$state" | jq -r '.store_only')") || return 2
+    node=$(_node_cli_borrowed_site "$core" "$proto" "$node" "$(printf '%s' "$state" | jq -r '.store_only')") || return 2
     if [[ "$(printf '%s' "$state" | jq -r '.store_only')" != "true" ]]; then
         node=$(_node_cli_tls_auto "$core" "$proto" "$node") || return 2
     fi

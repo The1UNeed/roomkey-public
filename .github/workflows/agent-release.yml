@@ -35,4 +35,4 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "psm-agent ${GITHUB_REF_NAME#agent-v}" --notes "psm-agent for roomkey servers (linux amd64, arm64, armv7), with SHA256SUMS."
+        run: gh release create "$GITHUB_REF_NAME" dist/* --latest=false --title "psm-agent ${GITHUB_REF_NAME#agent-v}" --notes "psm-agent for roomkey servers (linux amd64, arm64, armv7), with SHA256SUMS."

@@ -3,7 +3,7 @@
 import { onMounted, ref, watch } from 'vue'
 import { api, errorText, localTime, type AuditEntry } from '../api'
 import { toast } from '../ui'
-import { actionLabel } from '../audit'
+import { actionLabel, targetLabel } from '../audit'
 
 const log = ref<AuditEntry[]>([])
 const loaded = ref(false)
@@ -26,14 +26,14 @@ onMounted(() => loadLog(true))
 watch(category, () => loadLog(true))
 const categories = [
   { id: '', label: '全部' }, { id: 'login', label: '登录' }, { id: 'server', label: '服务器' }, { id: 'node', label: '节点' },
-  { id: 'relay', label: '中转' }, { id: 'subscription', label: '订阅' }, { id: 'settings', label: '设置' }, { id: 'template', label: '模板' },
+  { id: 'user', label: '用户' }, { id: 'subscription', label: '订阅' }, { id: 'settings', label: '设置' }, { id: 'template', label: '模板' },
 ]
-const actor = (a: string) => (a === 'admin' ? '管理员' : a === 'agent' ? '服务器' : a === 'anonymous' ? '未登录' : a)
+const actor = (a: string) => (a === 'admin' ? '管理员' : a === 'agent' ? '服务器' : a === 'anonymous' ? '未登录' : a === 'updater' ? '自动更新' : a)
 </script>
 
 <template>
   <div class="page-head">
-    <div><h1>操作日志</h1><p>登录、服务器接入，以及对服务器、节点、订阅和设置的每一次修改。</p></div>
+    <div><h1>操作日志</h1><p>登录、服务器接入，以及对服务器、节点、用户、订阅和设置的每一次修改。</p></div>
   </div>
 
   <div class="card">
@@ -44,14 +44,14 @@ const actor = (a: string) => (a === 'admin' ? '管理员' : a === 'agent' ? '服
       </div>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="cards">
         <thead><tr><th>时间</th><th>操作者</th><th>操作</th><th>对象</th><th>详情</th></tr></thead>
         <tbody>
           <tr v-for="e in log" :key="e.id" :data-test="`audit-${e.action}`">
             <td>{{ localTime(e.at) }}</td>
-            <td>{{ actor(e.actor) }}</td>
+            <td data-label="操作者">{{ actor(e.actor) }}</td>
             <td>{{ actionLabel(e.action) }}</td>
-            <td>{{ e.target }}</td>
+            <td data-label="对象">{{ targetLabel(e.target) }}</td>
             <td class="muted" style="white-space: normal; min-width: 240px">{{ e.detail }}</td>
           </tr>
         </tbody>

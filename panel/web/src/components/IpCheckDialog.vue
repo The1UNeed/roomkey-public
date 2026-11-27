@@ -104,8 +104,8 @@ const rows = computed(() => {
   <Modal :title="`${server.name} 的 IP 质量与解锁`" subtitle="IP 的归属、注册地、风险，能否发信，以及流媒体和 AI 服务的解锁情况。" size="wide" @close="emit('close')">
     <div class="dialog-body" data-test="ipcheck">
       <div v-if="state?.needs" class="notice warn" data-test="ipcheck-needs">
-        <strong>{{ state.needs === 'join' ? '服务器还没有接入面板' : `需要 psm-agent ${state.needs} 以上` }}</strong>
-        {{ state.needs === 'join' ? '接入后才能检测。' : '在服务器列表的 ⋯ 里先升级 psm-agent，再回来检测。' }}
+        <strong>{{ state.needs === 'join' ? '服务器还没有接入面板' : `需要服务器组件 ${state.needs} 以上` }}</strong>
+        {{ state.needs === 'join' ? '接入后才能检测。' : '在服务器列表的 ⋯ 里先点「更新这台服务器」，再回来检测。' }}
       </div>
       <p class="muted" style="margin-top: 0">
         <span v-if="state?.pending || starting"><span class="spinner" /> 正在检测（一般 10–30 秒）…</span>

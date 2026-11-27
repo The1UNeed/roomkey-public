@@ -7,7 +7,7 @@ export type Core = 'xray' | 'sing-box' | 'mihomo'
 /** A core, or the standalone program (snell-server for Snell, ss-rust for SS2022). */
 export type Engine = Core | 'standalone'
 
-export type FieldType = 'text' | 'password' | 'number' | 'select' | 'bool'
+export type FieldType = 'text' | 'password' | 'number' | 'select' | 'bool' | 'combo'
 
 export interface Field {
   key: string
@@ -18,7 +18,10 @@ export interface Field {
   engines?: Engine[]
   /** only when another field has one of these values, e.g. { mode: ['xhttp', 'ws'] } */
   when?: Record<string, string[]>
-  options?: { value: string; label: string }[]
+  /** select: the choices; combo: suggestions (any value can be typed), each with an optional note */
+  options?: { value: string; label: string; note?: string }[]
+  /** a short hint shown as ⓘ next to the label (help stays under the field) */
+  tip?: string
   /** a select whose value PSM wants as a number (its schema checks the type) */
   numeric?: boolean
   /** a bool PSM wants as JSON true / false (insecure, the older one, takes 1 / 0) */
@@ -73,7 +76,7 @@ const cert = (engines: Engine[]): Field[] => [
 ]
 const xrayDomain: Field = {
   key: 'domain', label: '域名', type: 'text', required: true, engines: ['xray'],
-  placeholder: 'hk.example.com', help: '证书由主菜单 10. SSL 证书管理签发，存放在 /etc/nginx/ssl/<域名>/',
+  placeholder: 'hk.example.com', help: '要先在服务器上签好这个域名的证书（服务器上运行 psm，选「SSL 证书管理」），它放在 /etc/nginx/ssl/<域名>/',
 }
 const password: Field = { key: 'password', label: '密码', type: 'password', placeholder: '留空自动生成' }
 // VLESS Encryption (post-quantum; psm node … --vless-enc). sing-box's VLESS has
@@ -84,13 +87,57 @@ const vlessEnc = (engines?: Engine[]): Field => ({
   options: [{ value: '', label: '不开启' }, { value: 'x25519', label: 'X25519' }, { value: 'mlkem768', label: 'ML-KEM-768' }],
 })
 const uuid: Field = { key: 'uuid', label: 'UUID', type: 'text', placeholder: '留空自动生成' }
-// REALITY's camouflage: this node's own domain and site (roomkey)
-const ownSite: Field = {
-  key: 'server_name', label: '本机域名', type: 'text', required: true, placeholder: 'n1.myroom.asia',
-  help: '已经解析到这台服务器的域名（不走 Cloudflare 代理），80 端口要能访问（签证书）。没有密钥的连接只会看到这台服务器自己的网页，不会被转发给任何第三方。可以和「服务器 → 域名跟随 IP」用同一个。',
+// REALITY's camouflage: this node's own domain and site (roomkey's default),
+// or a site borrowed on purpose. Without the key a connection is passed on to
+// the camouflage: to this server's own page, or to the borrowed site — which
+// is how a server ends up reported as a relay (DMIT), worst on a CDN.
+const camouflage: Field = {
+  key: 'camouflage', label: '伪装方式', type: 'select', default: 'own',
+  tip: '没有密钥的连接（扫描器、探测）会被交给伪装网站',
+  options: [
+    { value: 'own', label: '本机网站（推荐）', note: '没有密钥的连接只看到这台服务器自己的网页' },
+    { value: 'borrow', label: '借用其他网站', note: '伪装成 www.samsung.com 等大网站；没有密钥的连接会被转给那个网站' },
+  ],
 }
-/** The REALITY variants: their camouflage is always the node's own site. */
+const ownSite: Field = {
+  key: 'server_name', label: '本机域名', type: 'combo', required: true, placeholder: 'n1.example.com', when: { camouflage: ['own'] },
+  tip: '已解析到这台服务器、不走 Cloudflare 代理的域名',
+  help: '80 端口要能访问（签证书）。可以和「服务器 → 域名跟随 IP」用同一个。',
+}
+/**
+ * Sites people borrow for REALITY (3x-ui's scan list, and the usual ones from
+ * Xray's docs). Those on a shared CDN frontend let anyone without the key
+ * reach the whole CDN through the node: the probe says which, from the server.
+ */
+export const REALITY_TARGETS: { value: string; label: string; note?: string }[] = [
+  { value: 'www.samsung.com', label: 'Samsung' },
+  { value: 'www.amd.com', label: 'AMD' },
+  { value: 'www.nvidia.com', label: 'NVIDIA' },
+  { value: 'www.intel.com', label: 'Intel' },
+  { value: 'www.sony.com', label: 'Sony' },
+  { value: 'www.microsoft.com', label: 'Microsoft' },
+  { value: 'www.apple.com', label: 'Apple' },
+  { value: 'dl.google.com', label: 'Google 下载' },
+  { value: 'www.amazon.com', label: 'Amazon' },
+  { value: 'aws.amazon.com', label: 'AWS' },
+  { value: 'addons.mozilla.org', label: 'Mozilla 扩展' },
+  { value: 'www.cloudflare.com', label: 'Cloudflare', note: 'CDN：没有密钥的人能经这台服务器访问整个 Cloudflare，最容易被投诉' },
+]
+const borrowedSite: Field = {
+  key: 'target', label: '借用的网站', type: 'combo', required: true, default: 'www.samsung.com', when: { camouflage: ['borrow'] },
+  options: REALITY_TARGETS, placeholder: '选择或输入域名',
+  tip: '支持 TLS 1.3 + X25519 的大网站；点「探测」从这台服务器检查',
+}
+const acceptRisk: Field = {
+  key: 'accept_risk', label: '我知道风险：没有密钥的连接会被转给这个网站，服务器可能因此被投诉或停机', type: 'bool', default: false,
+  when: { camouflage: ['borrow'] },
+}
+/** The REALITY variants: their camouflage is the node's own site, or a borrowed one. */
 export const OWN_SITE_VARIANTS = ['vless-reality', 'vless-reality-layer']
+/** A site's domain (www.samsung.com): letters, digits and hyphens, a letter TLD, no IP, no port. */
+export function isSiteDomain(h: unknown): h is string {
+  return typeof h === 'string' && h.length <= 253 && /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(h)
+}
 
 const ALL_CORES: Engine[] = ['xray', 'sing-box', 'mihomo']
 const SB_MH: Engine[] = ['sing-box', 'mihomo']
@@ -154,12 +201,12 @@ export const PROTOCOLS: Protocol[] = [
       {
         id: 'vless-reality', label: 'REALITY', psm: 'reality', engines: ALL_CORES, defaultEngine: 'xray',
         fields: [
-          // roomkey: the camouflage is always the node's own site (a real
-          // certificate for its own domain, served on 127.0.0.1:8443). A
+          // roomkey: by default the camouflage is the node's own site (a real
+          // certificate for its own domain, served on 127.0.0.1:8443): a
           // connection without the key never reaches anyone else's server, so
           // the node cannot become a relay into a CDN — which is what got a
-          // server suspended. There is no third-party target to choose.
-          ownSite,
+          // server suspended. A borrowed site is the owner's informed choice.
+          camouflage, ownSite, borrowedSite, acceptRisk,
           uuid, vlessEnc(['xray']),
         ],
       },
@@ -201,7 +248,7 @@ export const PROTOCOLS: Protocol[] = [
         id: 'vless-reality-layer', label: 'REALITY + XHTTP / gRPC', psm: 'xhttp', engines: ['xray'], defaultEngine: 'xray',
         fixedFor: { xray: { mode: 'reality-layer' } },
         fields: [
-          ownSite,
+          camouflage, ownSite, borrowedSite, acceptRisk,
           { key: 'reality_transport', label: '传输方式', type: 'select', default: 'xhttp',
             options: [{ value: 'xhttp', label: 'XHTTP' }, { value: 'grpc', label: 'gRPC' }] },
           uuid, vlessEnc(['xray']),
@@ -450,14 +497,28 @@ export function validateNode(n: NodeInput):
     data[f.key] = f.type === 'number' || f.numeric ? Number(val) : f.type === 'bool' ? (f.jsonBool ? on : on ? 1 : 0) : val
   }
   Object.assign(data, v.fixedFor?.[n.engine])
-  // REALITY falls back to this node's own site; the loopback target is sent
-  // too, so even a PSM that ignored own_site could not keep a third-party one
+  // REALITY falls back to this node's own site (the loopback target is sent
+  // too, so even a PSM that ignored own_site could not keep a third-party
+  // one), or to the one site borrowed on purpose: its domain on 443
   if (OWN_SITE_VARIANTS.includes(v.id)) {
-    const sn = typeof data.server_name === 'string' ? data.server_name : ''
-    if (sn && !/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/.test(sn))
-      errors.push('本机域名：要填域名（例如 n1.myroom.asia），不能是 IP（证书签给域名）')
-    data.own_site = true
-    data.dest = '127.0.0.1:8443'
+    if (data.camouflage === 'borrow') {
+      const t = String(data.target ?? '').trim().toLowerCase()
+      if (!isSiteDomain(t)) errors.push('借用的网站：要填域名（例如 www.samsung.com），不能是 IP 或带端口')
+      if (data.accept_risk !== 1 && data.accept_risk !== true) errors.push('借用其他网站：先勾选「我知道风险」')
+      data.server_name = t
+      data.dest = `${t}:443`
+      data.own_site = false
+      data.borrowed_site = true
+    } else {
+      const sn = typeof data.server_name === 'string' ? data.server_name : ''
+      if (sn && !/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/.test(sn))
+        errors.push('本机域名：要填域名（例如 n1.example.com），不能是 IP（证书签给域名）')
+      data.own_site = true
+      data.borrowed_site = false
+      data.dest = '127.0.0.1:8443'
+    }
+    // the panel's own choices, not PSM's node store
+    delete data.camouflage; delete data.target; delete data.accept_risk
   }
   // a custom exit scope is the geosite list itself (PSM's exit_sites takes names)
   if (data.exit_sites === 'custom') data.exit_sites = data.exit_geosite
